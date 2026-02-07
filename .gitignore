@@ -1,0 +1,9 @@
+.python-version
+.venv
+.vscode
+__pycache__
+data_cache/goblin_khopsign/
+data_cache/lingauss/
+data/
+ckpts/
+output/
