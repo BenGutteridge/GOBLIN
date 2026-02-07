@@ -1,9 +1,8 @@
 # Can Graph Foundation Models Generalize Over Architecture?
 
-Code for reproducing results in the paper, submitted to the ICLR 2026 Workshop on Geometry-grounded Representation Learning and Generative Modeling.
+Code for reproducing results from our paper submitted to the ICLR 2026 Workshop on Geometry-grounded Representation Learning and Generative Modeling.
 
 ### Setup
-Assumes you
 ```
 # CPU-only (uses pyenv)
 export TORCH_VARIANT=cpu
