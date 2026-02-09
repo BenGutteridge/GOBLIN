@@ -8,3 +8,4 @@ data/
 ckpts/
 output/
 temp/
+data_cache/
