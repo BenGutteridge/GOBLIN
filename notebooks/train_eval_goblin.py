@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT))
 from goblin import GOBLIN, OperatorSearchConfig, ExpertsDeepSetConfig, MultiSearchConfig
 from goblin.data import (
     load_graph_dataset,
-    build_softhopsign_dataset,
+    build_hopsign_dataset,
     build_and_cache_distance_operators,
 )
 
@@ -103,8 +103,8 @@ p = hparams
 hparam_str = json.dumps(p, sort_keys=True)
 hparam_hash = hashlib.md5(hparam_str.encode()).hexdigest()
 
-model_ckpt_path = Path(f"ckpts/{hparam_hash}.pt")
-results_path = Path(f"output/results/{hparam_hash}.pt")
+model_ckpt_path = Path(f"ckpts/goblin/{hparam_hash}.pt")
+results_path = Path(f"output/results/goblin/{hparam_hash}.pt")
 results_path.parent.mkdir(parents=True, exist_ok=True)
 model_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -205,7 +205,7 @@ for k in tqdm(range(1, int(p["mu_max"]) + 1)):
     if ds_name not in eval_ds:
         continue
 
-    test_dataset = build_softhopsign_dataset(
+    test_dataset = build_hopsign_dataset(
         N=N,
         radius=radius,
         k=k,

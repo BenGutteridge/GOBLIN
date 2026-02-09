@@ -282,7 +282,7 @@ def apply_lin_heat_operator(
     return F.cpu()
 
 
-def build_softhopsign_dataset(
+def build_hopsign_dataset(
     N: int = 1000,
     radius: float = 0.1,
     k: float = 0.0,
@@ -348,7 +348,7 @@ def build_softhopsign_dataset(
     return dataset
 
 
-def build_softhopsign_dataset_wrapper(
+def build_hopsign_dataset_wrapper(
     N: int = 1000,
     radius: float = 0.1,
     k: float = 0.0,
@@ -357,7 +357,7 @@ def build_softhopsign_dataset_wrapper(
     topology_seed: int = 0,
 ):
 
-    dataset = build_softhopsign_dataset(
+    dataset = build_hopsign_dataset(
         N=N,
         radius=radius,
         k=k,
@@ -618,7 +618,7 @@ def load_graph_dataset(
     # -----------------------------
     if compute_all_pairs_dist:
         N = X.shape[0]
-        apspd_filepath = Path(f"data_cache/{name}_apspd.pt")
+        apspd_filepath = Path(f"data_cache/apspd/{name}_apspd.pt")
         if apspd_filepath.exists():
             print(f"Loading cached all pairs shortest path distances for {name}...")
             all_pairs_dist = torch.load(str(apspd_filepath))["spd"]
