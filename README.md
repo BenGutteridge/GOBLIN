@@ -1,6 +1,7 @@
-# Can Graph Foundation Models Generalize Over Architecture?
+# Graph Operator Basis Learning & Inference (GOBLIN)
+### An architecture-adaptive graph foundation model framework
 
-Code for reproducing results in the paper, submitted to the ICLR 2026 Workshop on Geometry-grounded Representation Learning and Generative Modeling.
+This repo contains code for reproducing results in the paper *Can Graph Foundation Models Generalize Over Architecture?*, published in the ICLR 2026 Workshop on Geometry-grounded Representation Learning and Generative Modeling.
 
 ### Setup
 ```
