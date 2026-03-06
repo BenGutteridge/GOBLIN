@@ -13,8 +13,8 @@ source .venv/bin/activate
 
 # OR: CUDA 11.8 (uses conda)
 export TORCH_VARIANT=cu118
-conda create -n graphany python=3.10 -y
-conda activate graphany
+conda create -n goblin python=3.10 -y
+conda activate goblin
 
 python -m pip install --upgrade pip setuptools wheel
 pip install "setuptools<70" packaging
