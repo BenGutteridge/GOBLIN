@@ -70,6 +70,8 @@ python notebooks/train_eval_goblin.py
 
 Results for GraphAny (Table 1) can be reproduced using `notebooks/hopsign_results_graphany.py`, which will train a GraphAny instance with given hyperparameters defined in the notebook and then evaluate on HopSign and real-world benchmarks. GraphAny code is adapted from [their repo](https://github.com/DeepGraphLearning/GraphAny).
 
+Before running experiments on CityNetworks, run `notebooks/compute_citynetwork_khops.py` to generate required shortest path distances. CityNetworks uses a maximum of 16-hop node interactions, and consists of very large graphs, so we pre-process these graphs separately to save hard disk memory and only compute the necessary distances.
+
 **Notes** 
 - Generating all-pairs shortest path distances can be time-consuming and memory-intensive, but they are cached
 - Evaluation on larger graphs can be slow if not using a GPU; we used H100s for CoPhysics and Questions and A10s elsewhere

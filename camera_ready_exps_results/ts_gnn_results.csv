@@ -1,0 +1,9 @@
+model,dataset,seed0,seed1,seed2,seed3,seed4,mean,std,n,notes
+TS-Mean (Cora),CityParis,20.221679,15.620516,13.736679,12.135417,13.583343,15.059526,3.140143,5,zero-shot from Cora; hid=16; London OOM
+TS-Mean (Cora),CityShanghai,23.447174,20.235838,19.066164,17.318789,18.550991,19.723789,2.330115,5,zero-shot from Cora; hid=16; London OOM
+TS-Mean (Cora),CityLA,19.162367,10.826047,15.213201,10.251414,13.021182,13.694842,3.631124,5,zero-shot from Cora; hid=16; London OOM
+TS-Mean (Cora),CityLondon,,,,,,,,,CUDA OOM
+TS-GAT (Cora),CityParis,16.101333,18.850421,13.974349,15.234987,17.656594,16.363537,1.930491,5,zero-shot from Cora; hid=16; London OOM
+TS-GAT (Cora),CityShanghai,20.991606,20.859755,18.393992,17.967853,21.459204,19.934483,1.623203,5,zero-shot from Cora; hid=16; London OOM
+TS-GAT (Cora),CityLA,16.604060,16.524048,13.351622,15.997735,16.761486,15.847790,1.424557,5,zero-shot from Cora; hid=16; London OOM
+TS-GAT (Cora),CityLondon,,,,,,,,,CUDA OOM

@@ -9,3 +9,7 @@ ckpts/
 output/
 temp/
 data_cache/
+.claude/
+scratch/
+slurm_logs/
+scripts/

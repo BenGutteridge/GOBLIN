@@ -68,6 +68,7 @@ hparams = {
 _parser = argparse.ArgumentParser()
 _parser.add_argument("--eval_dataset", type=str, default=None)
 _parser.add_argument("--train_dataset", type=str, default=None)
+_parser.add_argument("--seed", type=int, default=None)
 _args, _ = _parser.parse_known_args()
 
 eval_ds = [
@@ -122,11 +123,19 @@ p = hparams
 if _args.train_dataset is not None:
     p = dict(hparams)
     p["train_ds"] = _args.train_dataset
+if _args.seed is not None:
+    p = dict(p)
+    p["seed"] = _args.seed
 hparam_str = json.dumps(p, sort_keys=True)
 hparam_hash = hashlib.md5(hparam_str.encode()).hexdigest()
 
 model_ckpt_path = Path(f"ckpts/goblin/{hparam_hash}.pt")
-results_path = Path(f"output/results/goblin/{hparam_hash}.pt")
+# Use per-dataset results path when eval_dataset is specified, to avoid race
+# conditions when multiple parallel jobs share the same hparam_hash.
+if _args.eval_dataset is not None:
+    results_path = Path(f"output/results/goblin/{hparam_hash}/{_args.eval_dataset}.pt")
+else:
+    results_path = Path(f"output/results/goblin/{hparam_hash}.pt")
 results_path.parent.mkdir(parents=True, exist_ok=True)
 model_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
 
