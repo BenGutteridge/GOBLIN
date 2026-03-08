@@ -17,6 +17,7 @@ from PIL import Image
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 
+from goblin.config import DATA_CACHE
 from goblin.data import (
     apply_lin_gaussian_operator,
     apply_lin_heat_operator,
@@ -689,14 +690,16 @@ class GOBLIN:
         initialization_obs: Optional[List[float]] = None,
         seed: int = 0,
         dataset_name: str = "",
+        cache_dir: Path | None = None,
     ):
         self.data = data
         self.dataset_name = dataset_name
         self.X = X
         self.all_pairs_dist = all_pairs_dist
-        self.A = all_pairs_dist == 1
+        self.A = (all_pairs_dist == 1) if all_pairs_dist is not None else None
         self.N = X.shape[0]
         self.seed = seed
+        self.cache_dir = cache_dir if cache_dir is not None else DATA_CACHE
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
 
@@ -753,6 +756,7 @@ class GOBLIN:
         self.basis: list[OpId] | None = (
             None  # e.g. (|"gaussian", 2), ("fixed", "L1"), etc
         )
+
 
     def make_operator_families(
         self, cfg: OperatorSearchConfig
@@ -821,7 +825,7 @@ class GOBLIN:
                 X=self.X,
                 mu=mu,
                 sigma=self.sigma,
-                cache_dir=Path(f"data_cache/lingauss/{self.dataset_name}"),
+                cache_dir=(self.cache_dir / f"apspd/lingauss/{self.dataset_name}"),
             )
             Yhat = self.solve_linear_gnn(F=F, splits=list(splits))
             self._lin_gaussian_cache[(splits, mu)] = Yhat
@@ -972,7 +976,7 @@ class GOBLIN:
                     X=self.X,
                     mu=mu,
                     sigma=self.sigma,
-                    cache_dir=Path(f"data_cache/lingauss/{self.dataset_name}"),
+                    cache_dir=(self.cache_dir / f"apspd/lingauss/{self.dataset_name}"),
                 )
             elif op.family == "heat":
                 tau, key = op.param, (tuple(splits), op.param)

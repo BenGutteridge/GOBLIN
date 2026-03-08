@@ -5,6 +5,7 @@ import rootutils
 import json
 
 root = rootutils.setup_root(__file__, dotenv=True, pythonpath=True, cwd=False)
+from goblin.config import DATA_CACHE
 from graphany.utils import logger, timer
 from graphany.utils.experiment import init_experiment
 from graphany.data import GraphDataset, CombinedDataset
@@ -120,7 +121,7 @@ class InductiveNodeClassification(pl.LightningModule):
         )
         hash_key = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8]
         hashed_ckpt_path = os.path.join(
-            self.cfg.dirs.data_cache, "ckpts", f"{self.train_ds}_{hash_key}.pt"
+            DATA_CACHE, "ckpts", f"{self.train_ds}_{hash_key}.pt"
         )
         os.makedirs(os.path.dirname(hashed_ckpt_path), exist_ok=True)
         return hashed_ckpt_path, hash_key
@@ -232,7 +233,7 @@ class InductiveNodeClassification(pl.LightningModule):
 
         if kwargs.get("test", False):
             attn_filename = os.path.join(
-                self.cfg.dirs.data_cache,
+                DATA_CACHE,
                 f"{'+'.join(sorted(input.keys(), reverse=True))}_attn_weights",
                 self.cfg.dataset + "_attn.pt",
             )
@@ -517,7 +518,7 @@ def main(cfg: DictConfig):
             dataset: GraphDataset(
                 cfg,
                 dataset,
-                cfg.dirs.data_cache,
+                DATA_CACHE,
                 cfg.train_batch_size,
                 cfg.val_test_batch_size,
                 preprocess_device,
@@ -574,7 +575,7 @@ def main(cfg: DictConfig):
 
     # Save final results somewhere
     final_results_path = os.path.join(
-        cfg.dirs.data_cache,
+        DATA_CACHE,
         cfg.get("results_output", "results"),
         cfg.dataset,
         f"{cfg.dataset}_feat={cfg.feat_chn}_pred={cfg.pred_chn}_{cfg.hparams_hash}_results.json",

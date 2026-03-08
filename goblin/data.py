@@ -1,5 +1,6 @@
 import os
 import dgl
+from goblin.config import DATA_CACHE
 import networkx as nx
 from sympy import deg
 import torch
@@ -22,8 +23,10 @@ from torch_geometric.datasets import (
     Airports,
     HeterophilousGraphDataset,
     WebKB,
+    CityNetwork,
 )
 from torch_geometric.data import Data as PygGraph
+import gzip
 
 from ogb.nodeproppred import PygNodePropPredDataset
 
@@ -41,6 +44,76 @@ def apspd_to_tensor(G: PygGraph | nx.Graph) -> torch.Tensor:
         for v, dist in all_pairs_dist[u].items():
             dist_tensor[u, v] = dist
     return dist_tensor
+
+
+def build_and_cache_city_distance_operators(
+    city_name: str,
+    cache_dir: str | Path,
+    khop_dir: Path | None = None,
+    max_k: int = 16,
+):
+    """
+    Build sparse M_dist_k.pt files from pre-computed gzip k-hop shell files.
+    Used for CityNetwork datasets where the full N×N APSPD is too large to materialise.
+
+    Args:
+        city_name: GOBLIN dataset name, e.g. "CityParis", "CityShanghai", "CityLA", "CityLondon"
+        cache_dir: output directory for M_dist_*.pt files (lingauss cache for this dataset)
+        khop_dir:  directory containing {city}_khop_{k:02d}.pt files;
+                   defaults to DATA_CACHE / "citynetwork_apspd"
+        max_k:     maximum hop distance to cache (default 16)
+    """
+    if khop_dir is None:
+        khop_dir = DATA_CACHE / "citynetwork_apspd"
+    khop_dir = Path(khop_dir)
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # Read N from k=1 file (cheap meta-read)
+    with gzip.open(str(khop_dir / f"{city_name}_khop_01.pt"), "rb") as f:
+        meta = torch.load(f, weights_only=True)
+    N = meta["N"]
+
+    # M_dist_0: identity matrix (self-distance = 0)
+    path0 = os.path.join(cache_dir, "M_dist_0.pt")
+    if not os.path.exists(path0):
+        idx = torch.arange(N)
+        M_0 = torch.sparse_coo_tensor(
+            torch.stack([idx, idx]),
+            torch.ones(N, dtype=torch.float32),
+            size=(N, N),
+        ).coalesce()
+        torch.save(M_0, path0)
+        print(f"Saved dist=0 (identity), N={N}")
+    else:
+        print(f"Distance operator for dist=0 already cached. Skipping.")
+
+    # M_dist_k for k = 1..max_k
+    for k in range(1, max_k + 1):
+        path = os.path.join(cache_dir, f"M_dist_{k}.pt")
+        if os.path.exists(path):
+            print(f"Distance operator for dist={k} already cached. Skipping.")
+            continue
+        khop_file = khop_dir / f"{city_name}_khop_{k:02d}.pt"
+        if not khop_file.exists():
+            print(f"Warning: {khop_file} not found. Skipping dist={k}.")
+            continue
+        with gzip.open(str(khop_file), "rb") as f:
+            d = torch.load(f, weights_only=True)
+        N = d["N"]
+        row = d["row"].long()
+        col = d["col"].long()
+        # Reconstruct both directions from upper-triangle storage
+        all_row = torch.cat([row, col])
+        all_col = torch.cat([col, row])
+        M_k = torch.sparse_coo_tensor(
+            torch.stack([all_row, all_col]),
+            torch.ones(all_row.shape[0], dtype=torch.float32),
+            size=(N, N),
+        ).coalesce()
+        torch.save(M_k, path)
+        print(f"Saved dist={k}, nnz={M_k._nnz()}")
+
+    print("Done.")
 
 
 def get_L_sym_eigvals_eigvecs(
@@ -75,8 +148,14 @@ def get_L_sym_eigvals_eigvecs(
         eigvals, eigvecs = torch.linalg.eigh(L_sym)
         return L_sym, eigvals, eigvecs
 
-    # Large graph: keep sparse
-    L_sym = torch.eye(N) - A_norm
+    # Large graph: keep L_sym fully sparse to avoid OOM on large N
+    eye_idx = torch.arange(N, device=A.device)
+    I_sparse = torch.sparse_coo_tensor(
+        torch.stack([eye_idx, eye_idx]),
+        torch.ones(N, dtype=A_norm.dtype, device=A.device),
+        size=(N, N),
+    ).coalesce()
+    L_sym = (I_sparse - A_norm).coalesce()
     return L_sym, None, None
 
 
@@ -287,12 +366,11 @@ def build_hopsign_dataset(
     radius: float = 0.1,
     k: float = 0.0,
     label_noise: float = 0.5,
-    cache_dir: Path = Path("data_cache/goblin_khopsign"),
     topology_seed: int = 0,
 ):
     """Build a soft k-HopSign dataset on a random geometric graph."""
     saved_dataset_path = (
-        cache_dir
+        DATA_CACHE / "goblin_khopsign"
         / f"{k}HopSign_N={N}_r={radius}_ln={label_noise}_seed={topology_seed}.pt"
     )
 
@@ -353,16 +431,13 @@ def build_hopsign_dataset_wrapper(
     radius: float = 0.1,
     k: float = 0.0,
     label_noise: float = 0.5,
-    cache_dir: Path = Path("data_cache/goblin_khopsign"),
     topology_seed: int = 0,
 ):
-
     dataset = build_hopsign_dataset(
         N=N,
         radius=radius,
         k=k,
         label_noise=label_noise,
-        cache_dir=cache_dir,
         topology_seed=topology_seed,
     )
 
@@ -395,6 +470,50 @@ def build_hopsign_dataset_wrapper(
         val_mask,
         test_mask,
     )
+
+
+def build_city_network_dataset_wrapper(name: str):
+    """Wrapper to load a CityNetwork dataset in the format expected by GraphAny."""
+    city_map = {
+        "CityParis": "paris",
+        "CityShanghai": "shanghai",
+        "CityLA": "la",
+        "CityLondon": "london",
+    }
+    city = city_map[name]
+    root = DATA_CACHE / "city_networks"
+    dataset = CityNetwork(root=str(root), name=city)
+    data = dataset[0]
+
+    N = data.num_nodes
+    graph = dgl.graph((data.edge_index[0], data.edge_index[1]), num_nodes=N)
+    graph = dgl.to_simple(graph)
+    graph = dgl.to_bidirected(graph)
+
+    labels = data.y.long().squeeze()
+    num_classes = int(labels.max().item() + 1)
+    feat = data.x.float()
+
+    split_idx = 0
+    train_idx = extract_mask(data.train_mask, split_idx)
+    val_idx = extract_mask(data.val_mask, split_idx)
+    test_idx = extract_mask(data.test_mask, split_idx)
+    half = train_idx.numel() // 2
+    splits = {
+        "train_fit": train_idx[:half],
+        "train_eval": train_idx[half:],
+        "val": val_idx,
+        "test": test_idx,
+    }
+
+    train_mask = torch.zeros(N, dtype=torch.long)
+    val_mask = torch.zeros(N, dtype=torch.long)
+    test_mask = torch.zeros(N, dtype=torch.long)
+    train_mask[train_idx] = 1
+    val_mask[val_idx] = 1
+    test_mask[test_idx] = 1
+
+    return graph, labels, num_classes, feat, train_mask, val_mask, test_mask
 
 
 # -----------------------------
@@ -460,6 +579,46 @@ def graphany_style_split(
     }
 
 
+def city_network_split(
+    y_class: torch.Tensor,
+    *,
+    seed: int = 0,
+    train_frac: float = 0.10,
+    val_frac: float = 0.10,
+):
+    """
+    Fixed 10%/10%/80% transductive split for City-Networks,
+    matching the paper benchmark setup (Appendix §3).
+    """
+    y_np = y_class.cpu().numpy()
+    N = len(y_np)
+    idx = np.arange(N)
+
+    train_idx, rest_idx = train_test_split(
+        idx,
+        train_size=train_frac,
+        random_state=seed,
+        shuffle=True,
+        stratify=y_np,
+    )
+    val_size_of_rest = val_frac / (1.0 - train_frac)
+    val_idx, test_idx = train_test_split(
+        rest_idx,
+        train_size=val_size_of_rest,
+        random_state=seed,
+        shuffle=True,
+        stratify=y_np[rest_idx],
+    )
+
+    half = len(train_idx) // 2
+    return {
+        "train_fit": torch.tensor(train_idx[:half], dtype=torch.long),
+        "train_eval": torch.tensor(train_idx[half:], dtype=torch.long),
+        "val": torch.tensor(val_idx, dtype=torch.long),
+        "test": torch.tensor(test_idx, dtype=torch.long),
+    }
+
+
 def extract_mask(mask: torch.Tensor, split_idx: int = 0) -> torch.Tensor:
     """
     Handles both 1D masks [N] and 2D masks [N, K] (e.g. WikiCS).
@@ -477,6 +636,7 @@ def load_graph_dataset(
     root: Path,
     seed: int = 0,
     compute_all_pairs_dist: bool = False,
+    cache_dir: Path | None = None,
 ) -> tuple[
     PygGraph,
     torch.Tensor,
@@ -498,6 +658,8 @@ def load_graph_dataset(
         C              : number of classes
         data           : PyG Data object
     """
+    if cache_dir is None:
+        cache_dir = DATA_CACHE
 
     # Dataset dispatch (PyG only for now)
     if name in {"Cora", "Citeseer", "Pubmed"}:
@@ -575,6 +737,17 @@ def load_graph_dataset(
         compute_all_pairs_dist = False  # too big
         print("Warning: all_pairs_dist computation disabled for Arxiv due to size.")
 
+    elif name in {"CityParis", "CityShanghai", "CityLA", "CityLondon"}:
+        city = {
+            "CityParis": "paris",
+            "CityShanghai": "shanghai",
+            "CityLA": "la",
+            "CityLondon": "london",
+        }[name]
+        dataset = CityNetwork(root=str(root / "city_networks"), name=city)
+        data = dataset[0]
+        compute_all_pairs_dist = False  # full APSPD is too large for city networks
+
     else:
         raise ValueError(f"Unknown or unsupported dataset: {name}")
 
@@ -610,6 +783,8 @@ def load_graph_dataset(
             "val": val_idx,
             "test": test_idx,
         }
+    elif name in {"CityParis", "CityShanghai", "CityLA", "CityLondon"}:
+        splits = city_network_split(y_class, seed=seed)
     else:
         splits = graphany_style_split(y_class, seed=seed)
 
@@ -618,7 +793,7 @@ def load_graph_dataset(
     # -----------------------------
     if compute_all_pairs_dist:
         N = X.shape[0]
-        apspd_filepath = Path(f"data_cache/apspd/{name}_apspd.pt")
+        apspd_filepath = cache_dir / f"apspd/{name}_apspd.pt"
         if apspd_filepath.exists():
             print(f"Loading cached all pairs shortest path distances for {name}...")
             all_pairs_dist = torch.load(str(apspd_filepath))["spd"]

@@ -10,7 +10,6 @@ defaults:
 # ! Path
 project_root: ${hydra:runtime.cwd}
 dirs:
-  data_cache: ${project_root}/data_cache/graphany/ # Removable data cache
   data_storage: ${project_root}/data/graphany/ # Raw data files that shouldn't be removed
   temp: ${project_root}/temp/working_dir/${uid}/ # Removable experiment cache
   lightning_root: ${project_root}/temp/lightning_root/

@@ -1,3 +1,4 @@
+import argparse
 import numpy as np
 import hashlib
 import json
@@ -12,12 +13,16 @@ if ROOT.name == "notebooks":
 sys.path.insert(0, str(ROOT))
 
 from goblin import GOBLIN, OperatorSearchConfig, ExpertsDeepSetConfig, MultiSearchConfig
+from goblin.config import DATA_CACHE
 from goblin.data import (
     load_graph_dataset,
     build_hopsign_dataset,
     build_and_cache_distance_operators,
+    build_and_cache_city_distance_operators,
 )
 
+hopsign_cache_dir = DATA_CACHE / "goblin_khopsign"
+lingauss_cache_dir = DATA_CACHE / "apspd/lingauss"
 
 hparams = {
     "train_ds": "Cora",
@@ -58,11 +63,16 @@ hparams = {
     "epochs": 500,
 }
 
-# Uncomment as required
+# Uncomment as required, or pass --eval_dataset via CLI
+
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--eval_dataset", type=str, default=None)
+_parser.add_argument("--train_dataset", type=str, default=None)
+_args, _ = _parser.parse_known_args()
 
 eval_ds = [
     # # HopSign
-    "1HopSign",
+    # "1HopSign",
     # "2HopSign",
     # "3HopSign",
     # "4HopSign",
@@ -72,7 +82,7 @@ eval_ds = [
     # "8HopSign",
     #
     # # Benchmarks
-    "AirBrazil",
+    # "AirBrazil",
     # "AirUS",
     # "AirEU",
     # "Cornell",
@@ -97,9 +107,21 @@ eval_ds = [
     # "AmzRatings",
     # "CoPhysics",
     # "Questions",
+    #
+    # CityNetworks
+    "CityParis",
+    # "CityShanghai",
+    # "CityLA",
+    # "CityLondon",
 ]
 
+if _args.eval_dataset is not None:
+    eval_ds = [_args.eval_dataset]
+
 p = hparams
+if _args.train_dataset is not None:
+    p = dict(hparams)
+    p["train_ds"] = _args.train_dataset
 hparam_str = json.dumps(p, sort_keys=True)
 hparam_hash = hashlib.md5(hparam_str.encode()).hexdigest()
 
@@ -107,6 +129,8 @@ model_ckpt_path = Path(f"ckpts/goblin/{hparam_hash}.pt")
 results_path = Path(f"output/results/goblin/{hparam_hash}.pt")
 results_path.parent.mkdir(parents=True, exist_ok=True)
 model_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
+CITY_DATASETS = {"CityParis", "CityShanghai", "CityLA", "CityLondon"}
 
 print("Hparam hash:", hparam_hash)
 print("Sampled hyperparameters:", p)
@@ -117,14 +141,20 @@ data, X, all_pairs_dist, y_class, y_onehot, splits, C = load_graph_dataset(
     name=p["train_ds"],
     root=Path("data/goblin"),
     seed=p["seed"],
-    compute_all_pairs_dist=True,
+    compute_all_pairs_dist=(p["train_ds"] not in CITY_DATASETS),
 )
 
-build_and_cache_distance_operators(
-    all_pairs_dist,
-    max_dist=10,
-    cache_dir=f"data_cache/lingauss/{p['train_ds']}",
-)
+if p["train_ds"] in CITY_DATASETS:
+    build_and_cache_city_distance_operators(
+        city_name=p["train_ds"],
+        cache_dir=lingauss_cache_dir / p["train_ds"],
+    )
+else:
+    build_and_cache_distance_operators(
+        all_pairs_dist,
+        max_dist=10,
+        cache_dir=lingauss_cache_dir / p["train_ds"],
+    )
 
 operator_cfg = OperatorSearchConfig(
     families=["heat", "gaussian"],
@@ -192,7 +222,8 @@ metrics = goblin.train_deepset(verbose=True)
 goblin.save_deepset(model_ckpt_path)
 
 # ###### EVAL ########
-full_results = {"ckpt_path": str(model_ckpt_path), "hparams": p, "hash": hparam_hash}
+full_results = torch.load(results_path) if results_path.exists() else {}
+full_results.update({"ckpt_path": str(model_ckpt_path), "hparams": p, "hash": hparam_hash})
 
 # Evaluate on HopSign
 N = 1000
@@ -215,7 +246,7 @@ for k in tqdm(range(1, int(p["mu_max"]) + 1)):
     build_and_cache_distance_operators(
         test_dataset["all_pairs_dist"],
         max_dist=10,
-        cache_dir=f"data_cache/lingauss/{ds_name}",
+        cache_dir=hopsign_cache_dir / ds_name,
     )
 
     eval_goblin = GOBLIN(
@@ -249,18 +280,25 @@ for k in tqdm(range(1, int(p["mu_max"]) + 1)):
 for ds in tqdm(eval_ds):
     if ds.endswith("HopSign"):
         continue
+
     data, X, all_pairs_dist, y_class, y_onehot, splits, C = load_graph_dataset(
         name=ds,
         root=Path("data/goblin"),
         seed=p["seed"],
-        compute_all_pairs_dist=True,
+        compute_all_pairs_dist=(ds not in CITY_DATASETS),
     )
 
-    build_and_cache_distance_operators(
-        all_pairs_dist,
-        max_dist=10,
-        cache_dir=f"data_cache/lingauss/{ds}",
-    )
+    if ds in CITY_DATASETS:
+        build_and_cache_city_distance_operators(
+            city_name=ds,
+            cache_dir=lingauss_cache_dir / ds,
+        )
+    else:
+        build_and_cache_distance_operators(
+            all_pairs_dist,
+            max_dist=10,
+            cache_dir=lingauss_cache_dir / ds,
+        )
 
     eval_goblin = GOBLIN(
         data=data,
