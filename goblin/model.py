@@ -463,6 +463,10 @@ class ExpertsDeepSetConfig:
     n_batches: int = 1000
     batch_size: int = 128
     n_ref_per_class: int = 5
+    # random operator pool training
+    use_random_op_pool: bool = False
+    pool_size: int = 50          # operators in pool (split evenly gaussian/heat)
+    n_ops_per_batch: int = 5     # operators sampled from pool per batch
 
 
 class ExpertsDeepSet(nn.Module):
@@ -759,6 +763,8 @@ class GOBLIN:
         self.Yhat: Optional[torch.Tensor] = None  # (N,t,C)
         self._basis_Fs: Optional[list] = None     # cached F matrices per basis op
         self._last_loss_curve: list[float] = []
+        self._pool_ops: list[OpId] = []
+        self._pool_Fs: list[torch.Tensor] = []
 
         self.basis: list[OpId] | None = (
             None  # e.g. (|"gaussian", 2), ("fixed", "L1"), etc
@@ -1100,6 +1106,43 @@ class GOBLIN:
         self._basis_Fs = Fs
         return Fs
 
+    def build_random_op_pool(self) -> None:
+        """Sample a random pool of operators (uniform over µ/τ grids) and cache their F matrices.
+        Called once before train_deepset_pool. Splits pool evenly between gaussian and heat."""
+        cfg = self.deepset_cfg
+        cfg_s = self.operator_search_cfg
+        rng = np.random.default_rng(self.seed)
+
+        ops: list[OpId] = []
+        Fs: list[torch.Tensor] = []
+
+        # Gaussian half
+        n_gauss = cfg.pool_size // 2
+        mus = rng.uniform(cfg_s.mu_min, cfg_s.mu_max, n_gauss)
+        for mu in mus:
+            F = apply_lin_gaussian_operator(
+                X=self.X, mu=float(mu), sigma=self.sigma,
+                cache_dir=self.cache_dir / f"apspd/lingauss/{self.dataset_name}",
+            )
+            ops.append(OpId(family="gaussian", param=float(mu)))
+            Fs.append(F)
+
+        # Heat half
+        n_heat = cfg.pool_size - n_gauss
+        tausqrts = rng.uniform(cfg_s.tausqrt_min, cfg_s.tausqrt_max, n_heat)
+        for tausqrt in tausqrts:
+            F = apply_lin_heat_operator(
+                tau=float(tausqrt) ** 2, L_sym=self.L_sym,
+                X=self.X.to(self.L_sym.device),
+                eigvals=self.L_sym_eigvals, eigvecs=self.L_sym_eigvecs,
+            )
+            ops.append(OpId(family="heat", param=float(tausqrt)))
+            Fs.append(F)
+
+        self._pool_ops = ops
+        self._pool_Fs = Fs
+        print(f"Built random op pool: {len(ops)} operators ({n_gauss} Gaussian, {n_heat} Heat)")
+
     # ---- DeepSet ----
     def init_deepset(self):
         self.get_Yhat_experts(splits=["train_fit"])
@@ -1217,6 +1260,114 @@ class GOBLIN:
             y_class=self.y_class,
             splits={"val": self.splits["val"], "train": train_idx},
             score_feat=score_feat,
+        )
+
+    def train_deepset_pool(self, verbose: bool = True) -> Dict[str, float]:
+        """Pool-based stochastic training.
+
+        Each batch:
+          1. Sample n_ops_per_batch operators uniformly from the random pool
+          2. Partition train nodes into Vtarget (batch_size) and Vref pool
+          3. Sample n_ref_per_class nodes per class from Vref pool → Vref
+          4. Refit W = pinv(F[Vref]) @ Y[Vref] for each selected operator
+          5. Compute Yhat = F @ W; optionally compute per-op score feature from accuracy on Vtarget
+          6. Build DeepSet features, forward on Vtarget, backprop
+
+        At eval time, reverts to basis operators (from BO) refit on full train set.
+        """
+        cfg = self.deepset_cfg
+        if self.deepset is None:
+            self.init_deepset()
+        assert self.deepset is not None
+
+        if not self._pool_ops:
+            self.build_random_op_pool()
+
+        all_train_idx = torch.cat([self.splits["train_fit"], self.splits["train_eval"]])
+        opt = torch.optim.Adam(self.deepset.parameters(), lr=cfg.lr)
+        gen = torch.Generator()
+        gen.manual_seed(self.seed)
+        loss_curve: list[float] = []
+
+        pool_size = len(self._pool_ops)
+        n_ops = cfg.n_ops_per_batch
+        need_score = cfg.score_feature != "none"
+        n_score_dims = 2 if cfg.score_feature == "trimmed_and_lower_half" else 1
+
+        for batch_idx in range(cfg.n_batches):
+            self.deepset.train()
+
+            # Sample n_ops_per_batch from pool (without replacement)
+            op_perm = torch.randperm(pool_size, generator=gen)[:n_ops]
+            Fs_batch = [self._pool_Fs[i].cpu() for i in op_perm.tolist()]
+
+            # Partition labeled nodes: Vtarget | Vref pool
+            perm = torch.randperm(all_train_idx.numel(), generator=gen)
+            n_target = min(cfg.batch_size, all_train_idx.numel())
+            target_idx = all_train_idx[perm[:n_target]]
+            ref_pool = all_train_idx[perm[n_target:]]
+
+            ref_idx = sample_nodes_per_class(
+                self.y_class, ref_pool, cfg.n_ref_per_class, self.C, gen
+            )
+            if ref_idx.numel() == 0:
+                ref_idx = sample_nodes_per_class(
+                    self.y_class, all_train_idx, cfg.n_ref_per_class, self.C, gen
+                )
+
+            # Refit W per selected operator on Vref, compute Yhat
+            Yhat_list = []
+            Y_ref = self.y_onehot[ref_idx].float()
+            for F in Fs_batch:
+                W = torch.linalg.pinv(F[ref_idx]) @ Y_ref
+                Yhat_list.append(F @ W)
+
+            Yhat = torch.stack(Yhat_list, dim=1)  # (N, n_ops, C)
+
+            # Per-batch score features: standardized accuracy on Vtarget
+            if need_score:
+                rows = []
+                y_target = self.y_class[target_idx]
+                for Yhat_op in Yhat_list:
+                    preds = Yhat_op[target_idx].argmax(-1)
+                    acc = (preds == y_target).float().mean().item()
+                    acc_std = (acc - 1.0 / self.C) / max(1.0 - 1.0 / self.C, 1e-8)
+                    if n_score_dims == 1:
+                        rows.append([acc_std])
+                    else:
+                        rows.append([acc_std, acc_std])  # duplicate for lower_half slot
+                score_feat: torch.Tensor | None = torch.tensor(rows, dtype=torch.float32)
+            else:
+                score_feat = None
+
+            H = ExpertsDeepSet.build_features(Yhat, score_feat)
+            alpha = self.deepset(H[target_idx])
+            Yhat_bar = (alpha.unsqueeze(-1) * Yhat[target_idx]).sum(dim=1)
+            loss = self.deepset.loss_fn(Yhat_bar, self.y_class[target_idx])
+
+            if loss.isnan():
+                raise RuntimeError(f"NaN loss at batch {batch_idx}")
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            loss_curve.append(loss.item())
+            if verbose and batch_idx % cfg.log_every == 0:
+                print(f"Batch {batch_idx}, loss={loss.item():.4f}")
+
+        print(f"Final batch {batch_idx}, loss={loss_curve[-1]:.4f}")
+        self._last_loss_curve = loss_curve
+
+        # Eval using basis operators (from BO), refit on full train set
+        self.get_Yhat_experts(splits=["train_fit", "train_eval"])
+        train_idx = torch.cat([self.splits[s] for s in ["train_fit", "train_eval"]])
+        score_feat_eval = self.get_score_feat_tensor()
+        return self.deepset.evaluate(
+            Yhat=self.Yhat,
+            y_class=self.y_class,
+            splits={"val": self.splits["val"], "train": train_idx},
+            score_feat=score_feat_eval,
         )
 
     def eval_deepset(self, splits: list[str]) -> Dict[str, float]:
