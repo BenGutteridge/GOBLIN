@@ -64,6 +64,11 @@ hparams = {
     "num_head_layers": 1,
     "epochs": 500,
     "score_feature": "none",  # "none" | "trimmed" | "trimmed_and_lower_half"
+    # stochastic training (set to False to use fixed full-batch training)
+    "stochastic_training": True,
+    "n_batches": 1000,
+    "batch_size": 128,
+    "n_ref_per_class": 5,
 }
 
 # Uncomment as required, or pass --eval_dataset via CLI
@@ -213,6 +218,9 @@ deepset_cfg = ExpertsDeepSetConfig(
     lr=p["lr"],
     dropout=p["dropout"],
     score_feature=p["score_feature"],
+    n_batches=p["n_batches"],
+    batch_size=p["batch_size"],
+    n_ref_per_class=p["n_ref_per_class"],
 )
 
 goblin = GOBLIN(
@@ -239,13 +247,17 @@ basis = goblin.select_basis()
 print("Final basis:", basis)
 
 # ---- Train DeepSet ----
-metrics = goblin.train_deepset(verbose=True)
+if p["stochastic_training"]:
+    metrics = goblin.train_deepset_stochastic(verbose=True)
+else:
+    metrics = goblin.train_deepset(verbose=True)
 
 goblin.save_deepset(model_ckpt_path)
 
 # ###### EVAL ########
 full_results = torch.load(results_path) if results_path.exists() else {}
-full_results.update({"ckpt_path": str(model_ckpt_path), "hparams": p, "hash": hparam_hash})
+full_results.update({"ckpt_path": str(model_ckpt_path), "hparams": p, "hash": hparam_hash,
+                      "loss_curve": goblin._last_loss_curve, "train_metrics": metrics})
 
 # Evaluate on HopSign
 N = 1000

@@ -459,6 +459,10 @@ class ExpertsDeepSetConfig:
     log_every: int = 200
     dropout: float = 0.0  # TODO implement
     score_feature: str = "none"  # "none" | "trimmed" | "trimmed_and_lower_half"
+    # stochastic training mode
+    n_batches: int = 1000
+    batch_size: int = 128
+    n_ref_per_class: int = 5
 
 
 class ExpertsDeepSet(nn.Module):
@@ -548,12 +552,14 @@ class ExpertsDeepSet(nn.Module):
         *,
         score_feat: torch.Tensor | None = None,
         verbose: bool = True,
-    ) -> Dict[str, float]:
+    ) -> list[float]:
         """
         Train on given train_idx split (should be train_eval, with Yhat solved from from train_fit).
+        Returns loss_curve: list of per-epoch loss values.
         """
         H = self.build_features(Yhat, score_feat)
         opt = torch.optim.Adam(self.parameters(), lr=self.cfg.lr)
+        loss_curve: list[float] = []
 
         for epoch in range(self.cfg.epochs):
             self.train()
@@ -569,11 +575,12 @@ class ExpertsDeepSet(nn.Module):
             loss.backward()
             opt.step()
 
+            loss_curve.append(loss.item())
             if verbose and (epoch % self.cfg.log_every == 0):
                 print(f"Epoch {epoch}, loss={loss.item():.4f}")
 
         print(f"Final epoch {epoch}, loss={loss.item():.4f}")
-        return
+        return loss_curve
 
     @torch.no_grad()
     def evaluate(
@@ -636,6 +643,26 @@ class ExpertsDeepSet(nn.Module):
 
     def load(self, path: Path, map_location: str = "cpu"):
         self.load_state_dict(torch.load(path, map_location=map_location))
+
+
+def sample_nodes_per_class(
+    y_class: torch.Tensor,
+    pool_idx: torch.Tensor,
+    n_per_class: int,
+    C: int,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Sample up to n_per_class nodes per class from pool_idx. Mirrors GraphAny's
+    sample_k_nodes_per_label. Returns concatenated global node indices."""
+    sampled = []
+    pool_labels = y_class[pool_idx]
+    for c in range(C):
+        cls_mask = (pool_labels == c).nonzero(as_tuple=False).view(-1)
+        if cls_mask.numel() == 0:
+            continue
+        perm = torch.randperm(cls_mask.numel(), generator=generator)
+        sampled.append(pool_idx[cls_mask[perm[:n_per_class]]])
+    return torch.cat(sampled) if sampled else torch.empty(0, dtype=torch.long)
 
 
 # -----------------------------
@@ -730,6 +757,8 @@ class GOBLIN:
         self.deepset: Optional[ExpertsDeepSet] = None
 
         self.Yhat: Optional[torch.Tensor] = None  # (N,t,C)
+        self._basis_Fs: Optional[list] = None     # cached F matrices per basis op
+        self._last_loss_curve: list[float] = []
 
         self.basis: list[OpId] | None = (
             None  # e.g. (|"gaussian", 2), ("fixed", "L1"), etc
@@ -919,6 +948,7 @@ class GOBLIN:
     def update_basis(self, new_ops: list[OpId], overwrite: bool = False):
         if overwrite or self.basis is None:
             self.basis = []
+            self._basis_Fs = None
         assert self.basis is not None
         seen = set(self.basis)
         for op in new_ops:
@@ -1037,6 +1067,39 @@ class GOBLIN:
         self.Yhat = Yhat
         return Yhat  # (N, t, C)
 
+    def get_operator_Fs(self) -> list:
+        """Compute (or return cached) the raw F matrix for each basis operator.
+        F is (N, d) — the operator-transformed features used to fit each linear GNN.
+        Cached in self._basis_Fs; invalidated when basis changes via update_basis."""
+        if self._basis_Fs is not None:
+            return self._basis_Fs
+        if self.basis is None:
+            raise ValueError("No basis set. Run select_basis() first.")
+        Fs = []
+        for op in self.basis:
+            if op.family == "gaussian":
+                F = apply_lin_gaussian_operator(
+                    X=self.X,
+                    mu=op.param,
+                    sigma=self.sigma,
+                    cache_dir=(self.cache_dir / f"apspd/lingauss/{self.dataset_name}"),
+                )
+            elif op.family == "heat":
+                F = apply_lin_heat_operator(
+                    tau=op.param ** 2,
+                    L_sym=self.L_sym,
+                    X=self.X.to(self.L_sym.device),
+                    eigvals=self.L_sym_eigvals,
+                    eigvecs=self.L_sym_eigvecs,
+                )
+            elif op.family == "fixed":
+                F = get_fixed_operator(self.data, self.X, operator_name=op.param)
+            else:
+                raise ValueError(f"Unknown family: {op.family}")
+            Fs.append(F)
+        self._basis_Fs = Fs
+        return Fs
+
     # ---- DeepSet ----
     def init_deepset(self):
         self.get_Yhat_experts(splits=["train_fit"])
@@ -1057,13 +1120,14 @@ class GOBLIN:
         score_feat = self.get_score_feat_tensor()
 
         # Train on *train_eval* labels, with feats derived from Yhat fit to *train_fit* split
-        self.deepset.train_model(
+        loss_curve = self.deepset.train_model(
             Yhat=self.Yhat,
             y_class=self.y_class,
             train_idx=train_idx,
             score_feat=score_feat,
             verbose=verbose,
         )
+        self._last_loss_curve = loss_curve
 
         # Refit on full train set before eval
         self.get_Yhat_experts(splits=["train_fit", "train_eval"])
@@ -1074,6 +1138,86 @@ class GOBLIN:
             score_feat=score_feat,
         )
         return metrics
+
+    def train_deepset_stochastic(self, verbose: bool = True) -> Dict[str, float]:
+        """Stochastic mini-batch training following GraphAny's approach.
+
+        Each batch:
+          1. Randomly partition train_fit ∪ train_eval into Vtarget (batch_size) and a ref pool
+          2. Sample n_ref_per_class nodes per class from the ref pool → Vref
+          3. For each cached F: refit W = pinv(F[Vref]) @ Y[Vref], compute Yhat = F @ W
+          4. Build DeepSet features, forward on Vtarget, backprop
+
+        F matrices are computed once and cached; only W changes each batch (cheap pseudoinverse).
+        """
+        cfg = self.deepset_cfg
+        if self.deepset is None:
+            self.init_deepset()
+        assert self.deepset is not None
+
+        Fs = self.get_operator_Fs()
+        all_train_idx = torch.cat([self.splits["train_fit"], self.splits["train_eval"]])
+        score_feat = self.get_score_feat_tensor()
+        opt = torch.optim.Adam(self.deepset.parameters(), lr=cfg.lr)
+        gen = torch.Generator()
+        gen.manual_seed(self.seed)
+        loss_curve: list[float] = []
+
+        for batch_idx in range(cfg.n_batches):
+            self.deepset.train()
+
+            # Partition: first batch_size → Vtarget, rest → Vref pool
+            perm = torch.randperm(all_train_idx.numel(), generator=gen)
+            n_target = min(cfg.batch_size, all_train_idx.numel())
+            target_idx = all_train_idx[perm[:n_target]]
+            ref_pool = all_train_idx[perm[n_target:]]
+
+            ref_idx = sample_nodes_per_class(
+                self.y_class, ref_pool, cfg.n_ref_per_class, self.C, gen
+            )
+            if ref_idx.numel() == 0:
+                # edge case: pool empty, fall back to full train set minus target
+                ref_idx = sample_nodes_per_class(
+                    self.y_class, all_train_idx, cfg.n_ref_per_class, self.C, gen
+                )
+
+            # Refit W per operator using Vref
+            Yhat_list = []
+            for F in Fs:
+                F_cpu = F.cpu()
+                Y_ref = self.y_onehot[ref_idx].float()
+                W = torch.linalg.pinv(F_cpu[ref_idx]) @ Y_ref
+                Yhat_list.append(F_cpu @ W)
+            Yhat = torch.stack(Yhat_list, dim=1)  # (N, t, C) on CPU
+
+            H = ExpertsDeepSet.build_features(Yhat, score_feat)
+            alpha = self.deepset(H[target_idx])
+            Yhat_bar = (alpha.unsqueeze(-1) * Yhat[target_idx]).sum(dim=1)
+            loss = self.deepset.loss_fn(Yhat_bar, self.y_class[target_idx])
+
+            if loss.isnan():
+                raise RuntimeError(f"NaN loss at batch {batch_idx}")
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            loss_curve.append(loss.item())
+            if verbose and batch_idx % cfg.log_every == 0:
+                print(f"Batch {batch_idx}, loss={loss.item():.4f}")
+
+        print(f"Final batch {batch_idx}, loss={loss_curve[-1]:.4f}")
+        self._last_loss_curve = loss_curve
+
+        # Refit Yhat on full train set for eval (mirrors train_deepset)
+        self.get_Yhat_experts(splits=["train_fit", "train_eval"])
+        train_idx = torch.cat([self.splits[s] for s in ["train_fit", "train_eval"]])
+        return self.deepset.evaluate(
+            Yhat=self.Yhat,
+            y_class=self.y_class,
+            splits={"val": self.splits["val"], "train": train_idx},
+            score_feat=score_feat,
+        )
 
     def eval_deepset(self, splits: list[str]) -> Dict[str, float]:
         self.get_Yhat_experts(splits=["train_fit", "train_eval"])
