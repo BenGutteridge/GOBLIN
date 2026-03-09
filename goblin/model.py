@@ -78,8 +78,7 @@ class OperatorSearchConfig:
     bo_objective: (
         str  # "mean", "trimmed_{%}", "lower_/upper_quartile", "mean_minus_var_{lambda}"
     )
-    num_explore_steps: int
-    num_exploit_steps: int
+    ucb_beta: float = 1.0  # β in acq = -µ_GP + β·σ_GP; 0 = pure exploitation
 
     # LinGaussian
     mu_min: float = 0.0
@@ -105,11 +104,9 @@ class OperatorSearchConfig:
 
 @dataclass
 class MultiSearchConfig:
-    total_steps: int  # total BO steps across both families
-    mix_strategy: str  # "balanced" | "biased" | "adaptive"
+    n_samples: int        # total linear GNN solve budget, including anchor evaluations
     basis_size: int
     basis_selection_rule: str
-    bias_prob: float = 0.5  # used for bias strategies
     enforce_family_coverage: bool = False  # when picking final basis
     include_fixed_ops: list[str] = None  # e.g. ["X", "L1", "H1"]
     diversity_lambda: float = 0.0  # λ for greedy_diversity rule (0 = pure top-k)
@@ -131,51 +128,15 @@ class MultiOperatorSearch:
         self.goblin = goblin
         self.cfg = cfg
         self.searches = searches
-        self.families = list(searches.keys())
-        self.rng = np.random.default_rng(goblin.seed)
 
         self.sampled_ops: list[OpId] = []
         self.sampled_scores: dict[OpId, float] = {}
 
     # --------------------------------------------------
-    # Family selection
-    # --------------------------------------------------
-    def _choose_family(self, t: int) -> str:
-        families = self.families
-
-        # Single-family = degenerate multi-family
-        if len(families) == 1:
-            return families[0]
-
-        if self.cfg.mix_strategy == "balanced":
-            return families[t % len(families)]
-
-        if self.cfg.mix_strategy == "biased":
-            # two-family only; bias toward first family
-            return (
-                families[0] if self.rng.random() < self.cfg.bias_prob else families[1]
-            )
-
-        if self.cfg.mix_strategy == "adaptive":
-            if t < self.cfg.total_steps // 2:
-                return families[t % len(families)]
-
-            # bias toward family with best score so far
-            best_by_family = {}
-            for f in families:
-                best_by_family[f] = max(
-                    (v for k, v in self.sampled_scores.items() if k.family == f),
-                    default=-1e9,
-                )
-            return max(best_by_family, key=best_by_family.get)
-
-        raise ValueError(f"Unknown mix_strategy: {self.cfg.mix_strategy}")
-
-    # --------------------------------------------------
-    # Main BO loop
+    # Main UCB loop
     # --------------------------------------------------
     def run(self):
-        # ---- Inject fixed operators (optional) ----
+        # ---- Fixed operators ----
         if self.cfg.include_fixed_ops:
             for name in self.cfg.include_fixed_ops:
                 op = OpId("fixed", name)
@@ -183,9 +144,9 @@ class MultiOperatorSearch:
                 self.sampled_ops.append(op)
                 self.sampled_scores[op] = acc
 
-        # ---- Inject informed initial samples ----
-        # These replace the default param_grid[0]=0 GP initialisation with
-        # more informative starting points (configurable via mu_anchor / tausqrt_anchor).
+        # ---- Anchor initial observations ----
+        # Evaluated before the UCB loop; fed into each GP as its first observation.
+        n_anchors = 0
         _anchors = {"gaussian": self.cfg.mu_anchor, "heat": self.cfg.tausqrt_anchor}
         for fam_name, anchor_param in _anchors.items():
             if anchor_param is None:
@@ -195,29 +156,31 @@ class MultiOperatorSearch:
             search = self.searches[fam_name]
             acc_std = search.family.eval_fn(float(anchor_param), standardized=True)
             acc_raw = search.family.eval_fn(float(anchor_param), standardized=False)
-            # Replace default GP initialisation with this anchor
             search.param_obs = [float(anchor_param)]
             search.y_obs = [-acc_std]
-            # Add to candidate pool for basis selection
             op = OpId(fam_name, float(anchor_param))
             self.sampled_ops.append(op)
             self.sampled_scores[op] = acc_raw
+            n_anchors += 1
 
-        # ---- BO loop ----
-        for t in tqdm(range(self.cfg.total_steps)):
-            fam = self._choose_family(t)
+        # ---- UCB loop ----
+        # At each step, compute UCB across all families and sample the most promising.
+        # UCB values are in standardized accuracy space (comparable across families).
+        beta = self.goblin.operator_search_cfg.ucb_beta
+        n_ucb_steps = self.cfg.n_samples - n_anchors
+        for _ in tqdm(range(n_ucb_steps)):
+            best_params: dict[str, float] = {}
+            best_acqs: dict[str, float] = {}
+            for fam_name, search in self.searches.items():
+                param, acq_val = search.suggest_ucb(beta)
+                best_params[fam_name] = param
+                best_acqs[fam_name] = acq_val
+
+            fam = max(best_acqs, key=best_acqs.get)
+            param_next = best_params[fam]
             search = self.searches[fam]
 
-            phase, param_next = search.suggest_next(
-                t=min(t, search.cfg.num_explore_steps + search.cfg.num_exploit_steps)
-            )
-            if param_next is None:
-                continue
-
-            # update GP for that family
-            search.observe(phase, param_next)
-
-            # record globally
+            search.observe("ucb", param_next)
             op = OpId(fam, float(param_next))
             acc = search.family.eval_fn(float(param_next), standardized=False)
             self.sampled_ops.append(op)
@@ -456,47 +419,20 @@ class OperatorSearch:
         gp_mean, gp_std = gp.predict(self.param_grid.reshape(-1, 1), return_std=True)
         self.gp, self.gp_mean, self.gp_std = gp, gp_mean, gp_std
 
-    def _pick_explore(self) -> float:
-        # maximin in k-space (space-filling)
-        distances = np.min(
-            np.abs(self.param_grid[:, None] - np.array(self.param_obs)[None, :]), axis=1
-        )
-        # skip already sampled (just in case)
-        for idx in np.argsort(-distances):
-            k_candidate = float(self.param_grid[idx])
-            if not any(np.isclose(k_candidate, self.param_obs, atol=1e-6)):
-                return k_candidate
-        # fallback (shouldn't happen)
-        return float(self.param_grid[np.argmax(distances)])
+    def suggest_ucb(self, beta: float) -> tuple[float, float]:
+        """Fit GP and return (best_param, acq_value) for cross-family comparison.
 
-    def _pick_exploit(self) -> float:
-        # maximize mean in original objective: we stored y = -std_acc, so
-        # minimizing mean corresponds to maximizing standardized_acc (and thus accuracy).
-        assert self.gp_mean is not None
-        sorted_idx = np.argsort(self.gp_mean)  # ascending mean -> best
-
-        for idx in sorted_idx:
-            param_candidate = float(self.param_grid[idx])
-            if not any(np.isclose(param_candidate, self.param_obs, atol=1e-6)):
-                return param_candidate
-
-        # fallback: reuse best (may already be sampled)
-        return float(self.param_grid[np.argmin(self.gp_mean)])
-
-    def suggest_next(self, t: int) -> tuple[str, float | None]:
+        acq(θ) = -gp_mean(θ) + beta * gp_std(θ)
+        GP stores y = -standardized_acc, so -gp_mean ≈ standardized_acc.
+        Already-sampled points are masked to -inf.
+        Returns argmax param and its acquisition value.
         """
-        Returns (phase, param_next). param_next=None means 'final' frame.
-        """
-        num_total = self.cfg.num_explore_steps + self.cfg.num_exploit_steps
-
         self._fit_gp()
-
-        if t < self.cfg.num_explore_steps:
-            return "explore", self._pick_explore()
-        elif t < num_total:
-            return "exploit", self._pick_exploit()
-        else:
-            return "final", None
+        acq = -self.gp_mean + beta * self.gp_std
+        for p in self.param_obs:
+            acq[np.isclose(self.param_grid, p, atol=1e-6)] = -np.inf
+        best_idx = int(np.argmax(acq))
+        return float(self.param_grid[best_idx]), float(acq[best_idx])
 
     def observe(self, phase: str, param_next: float):
         """Record an observation of the parameter and its evaluation."""
@@ -761,6 +697,7 @@ class GOBLIN:
             self.L_sym_eigvals = self.L_sym_eigvals.to(self.device)
             self.L_sym_eigvecs = self.L_sym_eigvecs.to(self.device)
 
+        self.operator_search_cfg = operator_search_cfg
         self.bo_objective = operator_search_cfg.bo_objective
         self.basis_selection_rule = multi_search_cfg.basis_selection_rule
 

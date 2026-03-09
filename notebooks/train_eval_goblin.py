@@ -31,12 +31,10 @@ hparams = {
     "seed": 0,
     "bo_objective": "trimmed_20",
     "basis_size": 2,
-    "mix_strategy": "balanced",
-    "bias_prob": 0.50,
     "basis_selection_rule": "diverse_top_k",
     "enforce_family_coverage": False,
-    "num_explore_steps": 9,
-    "num_exploit_steps": 6,
+    "n_samples": 15,    # total linear GNN solves including anchors
+    "ucb_beta": 1.0,    # β in acq = -µ_GP + β·σ_GP; 0 = pure exploitation
     # LinGauss
     "mu_min": 0.0,
     "mu_max": 8.0,
@@ -184,8 +182,7 @@ print(f"Train mean SPD: {_train_mean_spd:.3f} → mu_max={_train_mu_max:.3f}, ta
 operator_cfg = OperatorSearchConfig(
     families=["heat", "gaussian"],
     bo_objective=p["bo_objective"],
-    num_explore_steps=p["num_explore_steps"],
-    num_exploit_steps=p["num_exploit_steps"],
+    ucb_beta=p["ucb_beta"],
     mu_min=p["mu_min"],
     mu_max=_train_mu_max,
     mu_num=p["mu_num"],
@@ -197,10 +194,8 @@ operator_cfg = OperatorSearchConfig(
 )
 
 multi_search_cfg = MultiSearchConfig(
-    total_steps=(p["num_explore_steps"] + p["num_exploit_steps"]),
-    mix_strategy=p["mix_strategy"],
+    n_samples=p["n_samples"],
     basis_size=p["basis_size"],
-    bias_prob=p["bias_prob"],
     enforce_family_coverage=p["enforce_family_coverage"],
     include_fixed_ops=p["fixed_operators"],
     basis_selection_rule=p["basis_selection_rule"],
