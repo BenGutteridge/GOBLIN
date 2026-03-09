@@ -66,6 +66,7 @@ hparams = {
     "num_deepset_layers": 2,
     "num_head_layers": 1,
     "epochs": 500,
+    "score_feature": "none",  # "none" | "trimmed" | "trimmed_and_lower_half"
 }
 
 # Uncomment as required, or pass --eval_dataset via CLI
@@ -216,6 +217,7 @@ deepset_cfg = ExpertsDeepSetConfig(
     epochs=p["epochs"],
     lr=p["lr"],
     dropout=p["dropout"],
+    score_feature=p["score_feature"],
 )
 
 goblin = GOBLIN(

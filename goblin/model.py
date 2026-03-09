@@ -492,6 +492,7 @@ class ExpertsDeepSetConfig:
     epochs: int = 1000
     log_every: int = 200
     dropout: float = 0.0  # TODO implement
+    score_feature: str = "none"  # "none" | "trimmed" | "trimmed_and_lower_half"
 
 
 class ExpertsDeepSet(nn.Module):
@@ -548,10 +549,13 @@ class ExpertsDeepSet(nn.Module):
         return alpha
 
     @staticmethod
-    def build_features(Yhat: torch.Tensor) -> torch.Tensor:
+    def build_features(
+        Yhat: torch.Tensor, score_feat: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """
         Yhat: (N, t, C) probabilities from t experts.
-        Returns H_0: (N, t, 4) DeepSet input feats, using pairwise squared distances summary stats.
+        score_feat: optional (t, n_scores) standardized BO scores per operator.
+        Returns H_0: (N, t, 4+n_scores) DeepSet input feats.
         """
         N, t, C = Yhat.shape
         diff = (Yhat.unsqueeze(2) - Yhat.unsqueeze(1)).pow(2).sum(dim=-1)  # (N,t,t)
@@ -563,8 +567,12 @@ class ExpertsDeepSet(nn.Module):
         min_diff = diff_ij.min(dim=-1).values
         max_diff = diff_ij.max(dim=-1).values
 
-        H = torch.stack([mean_diff, var_diff, min_diff, max_diff], dim=-1)
-        return H  # (N, t, 4)
+        H = torch.stack([mean_diff, var_diff, min_diff, max_diff], dim=-1)  # (N, t, 4)
+        if score_feat is not None:
+            # score_feat: (t, n_scores) -> broadcast to (N, t, n_scores)
+            sf = score_feat.unsqueeze(0).expand(N, -1, -1).to(H.device)
+            H = torch.cat([H, sf], dim=-1)
+        return H
 
     def train_model(
         self,
@@ -572,12 +580,13 @@ class ExpertsDeepSet(nn.Module):
         y_class: torch.Tensor,
         train_idx: torch.Tensor,
         *,
+        score_feat: torch.Tensor | None = None,
         verbose: bool = True,
     ) -> Dict[str, float]:
         """
         Train on given train_idx split (should be train_eval, with Yhat solved from from train_fit).
         """
-        H = self.build_features(Yhat)
+        H = self.build_features(Yhat, score_feat)
         opt = torch.optim.Adam(self.parameters(), lr=self.cfg.lr)
 
         for epoch in range(self.cfg.epochs):
@@ -606,9 +615,11 @@ class ExpertsDeepSet(nn.Module):
         Yhat: torch.Tensor,
         y_class: torch.Tensor,
         splits: dict[str, torch.Tensor],
+        *,
+        score_feat: torch.Tensor | None = None,
     ) -> dict[str, float]:
         self.eval()
-        H = self.build_features(Yhat)
+        H = self.build_features(Yhat, score_feat)
         res = {}
         for split, split_idx in splits.items():
             alpha_eval = self(H[split_idx])
@@ -869,7 +880,12 @@ class GOBLIN:
 
         return self.eval_accuracy(Yhat=Yhat, standardized=standardized)
 
-    def eval_accuracy(self, Yhat: torch.Tensor, standardized: bool = False) -> float:
+    def eval_accuracy(
+        self,
+        Yhat: torch.Tensor,
+        standardized: bool = False,
+        bo_objective: str | None = None,
+    ) -> float:
         """Given a linear GNNs logits [N, C], evaluate accuracy on train_eval split, for BO."""
         # Evaluate on train_eval
         eval_idxs = self.splits["train_eval"]
@@ -895,7 +911,7 @@ class GOBLIN:
         n = len(correct_sorted)
 
         # Specific objectives
-        obj = self.bo_objective
+        obj = bo_objective if bo_objective is not None else self.bo_objective
 
         if obj == "mean":
             acc = correct.mean()
@@ -956,6 +972,47 @@ class GOBLIN:
         self.update_basis(basis, overwrite=True)
         return basis
 
+    # ---- Score features for DeepSet ----
+
+    def _get_op_yhat_bo(self, op: OpId) -> torch.Tensor:
+        """Return Yhat (train_fit split) for a basis op — from BO cache or freshly computed."""
+        splits = ("train_fit",)
+        if op.family == "gaussian":
+            return self._lin_gaussian_cache[(splits, op.param)]
+        elif op.family == "heat":
+            return self._lin_heat_cache[(splits, op.param ** 2)]
+        elif op.family == "fixed":
+            F = get_fixed_operator(self.data, self.X, operator_name=op.param)
+            return self.solve_linear_gnn(F=F, splits=list(splits))
+        else:
+            raise ValueError(f"Unknown family: {op.family}")
+
+    def get_score_feat_tensor(self) -> torch.Tensor | None:
+        """
+        Build (t, n_score_dims) standardized score features for the current basis.
+        Returns None if score_feature == "none" or no basis is set.
+
+        Both features use fixed objectives (independent of bo_objective):
+          - "trimmed": trimmed_20 mean accuracy, standardized as (acc - 1/C) / (1 - 1/C)
+          - "trimmed_and_lower_half": above + lower_half accuracy, standardized
+
+        Yhat is retrieved from the BO cache (train_fit split), so objective re-evaluation
+        requires no GNN recomputation.
+        """
+        sf = self.deepset_cfg.score_feature
+        if sf == "none" or self.basis is None:
+            return None
+        rows = []
+        for op in self.basis:
+            yhat = self._get_op_yhat_bo(op)
+            trimmed = self.eval_accuracy(yhat, bo_objective="trimmed_20", standardized=True)
+            if sf == "trimmed":
+                rows.append([trimmed])
+            else:  # "trimmed_and_lower_half"
+                lower = self.eval_accuracy(yhat, bo_objective="lower_half", standardized=True)
+                rows.append([trimmed, lower])
+        return torch.tensor(rows, dtype=torch.float32)  # (t, 1 or 2)
+
     # ---- Build LinearGNN experts ----
     def get_Yhat_experts(self, splits: list[str]) -> torch.Tensor:
         """Get linear GNNs Yhat fit to training labels for each basis"""
@@ -1014,8 +1071,8 @@ class GOBLIN:
     # ---- DeepSet ----
     def init_deepset(self):
         self.get_Yhat_experts(splits=["train_fit"])
-
-        feat_dim = ExpertsDeepSet.build_features(self.Yhat).shape[-1]
+        score_feat = self.get_score_feat_tensor()
+        feat_dim = ExpertsDeepSet.build_features(self.Yhat, score_feat).shape[-1]
         self.deepset = ExpertsDeepSet(
             feat_dim=feat_dim, cfg=self.deepset_cfg, seed=self.seed
         )
@@ -1028,12 +1085,14 @@ class GOBLIN:
         assert self.deepset is not None and self.Yhat is not None
 
         train_idx = torch.cat([self.splits[split] for split in ["train_eval"]])
+        score_feat = self.get_score_feat_tensor()
 
         # Train on *train_eval* labels, with feats derived from Yhat fit to *train_fit* split
         self.deepset.train_model(
             Yhat=self.Yhat,
             y_class=self.y_class,
             train_idx=train_idx,
+            score_feat=score_feat,
             verbose=verbose,
         )
 
@@ -1043,6 +1102,7 @@ class GOBLIN:
             Yhat=self.Yhat,
             y_class=self.y_class,
             splits={"val": self.splits["val"], "train": train_idx},
+            score_feat=score_feat,
         )
         return metrics
 
@@ -1052,6 +1112,7 @@ class GOBLIN:
             raise ValueError(
                 "DeepSet not initialised. Call init_deepset() or train_deepset() or load_deepset()."
             )
+        score_feat = self.get_score_feat_tensor()
         eval_splits = {split: self.splits[split] for split in splits}
         eval_splits["+".join(splits)] = torch.cat(
             [self.splits[split] for split in splits]
@@ -1060,6 +1121,7 @@ class GOBLIN:
             Yhat=self.Yhat,
             y_class=self.y_class,
             splits=eval_splits,
+            score_feat=score_feat,
         )
 
     def save_deepset(self, path: Path):
