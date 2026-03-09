@@ -11,5 +11,7 @@ temp/
 data_cache/
 .claude/
 scratch/
+smoke_tests/
 slurm_logs/
 scripts/
+claude_notes/

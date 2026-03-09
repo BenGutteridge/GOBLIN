@@ -159,6 +159,43 @@ def get_L_sym_eigvals_eigvecs(
     return L_sym, None, None
 
 
+def compute_mean_spd(
+    all_pairs_dist: torch.Tensor | None,
+    cache_dir: Path | None = None,
+    max_k: int = 16,
+) -> float:
+    """
+    Compute mean shortest-path distance (excluding self-distances).
+
+    If all_pairs_dist is provided (regular datasets), computes the mean over
+    all pairs with distance > 0 (self-distances are 0, unreachable pairs are -1).
+
+    If all_pairs_dist is None (e.g. CityNetworks), loads M_dist_k.pt files from
+    cache_dir and computes the weighted mean over available pairs (k=1..max_k).
+    Each M_dist_k is stored with both directions, so nnz == 2 * num_pairs.
+    """
+    if all_pairs_dist is not None:
+        valid = all_pairs_dist[all_pairs_dist > 0].float()
+        return valid.mean().item()
+
+    if cache_dir is None:
+        raise ValueError("cache_dir must be provided when all_pairs_dist is None")
+    cache_dir = Path(cache_dir)
+    total_dist = 0.0
+    total_count = 0
+    for k in range(1, max_k + 1):
+        path = cache_dir / f"M_dist_{k}.pt"
+        if not path.exists():
+            break
+        M = torch.load(path, weights_only=True)
+        count = M._nnz() // 2  # both directions stored
+        total_dist += k * count
+        total_count += count
+    if total_count == 0:
+        return 1.0
+    return total_dist / total_count
+
+
 def build_and_cache_distance_operators(
     apspd: torch.Tensor,  # (N, N) int, CPU
     max_dist: int,

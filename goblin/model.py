@@ -87,11 +87,11 @@ class OperatorSearchConfig:
     mu_num: int = 250
     search_min_sep_mu: float = 0.2
 
-    # LinHeat
-    tau_min: float = 0.0
-    tau_max: float = 5.0
-    tau_num: int = 50
-    search_min_sep_tau: float = 0.1
+    # LinHeat (search is over tausqrt = sqrt(tau); eval squares before passing to kernel)
+    tausqrt_min: float = 0.0
+    tausqrt_max: float = 2.5
+    tausqrt_num: int = 50
+    search_min_sep_tausqrt: float = 0.1
 
     # GP settings
     rbf_length_scale: float = 1.0
@@ -111,7 +111,7 @@ class MultiSearchConfig:
     mix_strategy: str  # "balanced" | "biased" | "adaptive"
     basis_size: int
     basis_min_sep_mu: float
-    basis_min_sep_tau: float
+    basis_min_sep_tausqrt: float
     basis_selection_rule: str
     bias_prob: float = 0.5  # used for bias strategies
     enforce_family_coverage: bool = False  # when picking final basis
@@ -235,7 +235,7 @@ class MultiOperatorSearch:
                     continue
                 dist = abs(float(c.param) - float(op.param))
                 min_sep = (
-                    self.cfg.basis_min_sep_tau
+                    self.cfg.basis_min_sep_tausqrt
                     if op.family == "heat"
                     else self.cfg.basis_min_sep_mu
                 )
@@ -440,7 +440,7 @@ class OperatorSearch:
 
             # spacing among exploit points
             min_sep = (
-                self.cfg.search_min_sep_tau
+                self.cfg.search_min_sep_tausqrt
                 if self.family.name == "heat"
                 else self.cfg.search_min_sep_mu
             )
@@ -727,7 +727,7 @@ class GOBLIN:
         # NOTE: only ever written to during operator search, never DeepSet training/eval.
         self._lin_heat_cache: dict[tuple[tuple[str, ...], float], torch.Tensor] = (
             {}
-        )  # ((split_str,), tau) -> Yhat
+        )  # ((split_str,), tau) -> Yhat  [keys are actual τ = tausqrt**2]
         self._lin_gaussian_cache: dict[tuple[tuple[str, ...], float], torch.Tensor] = {}
 
         # Create operator families
@@ -773,10 +773,10 @@ class GOBLIN:
         )
         fams["heat"] = OperatorFamily(
             name="heat",
-            param_name="tau",
-            grid=np.linspace(cfg.tau_min, cfg.tau_max, cfg.tau_num),
-            eval_fn=lambda tau, standardized: self.eval_accuracy_lin_heat(
-                tau, standardized
+            param_name="tausqrt",
+            grid=np.linspace(cfg.tausqrt_min, cfg.tausqrt_max, cfg.tausqrt_num),
+            eval_fn=lambda tausqrt, standardized: self.eval_accuracy_lin_heat(
+                tausqrt**2, standardized
             ),
         )
         return fams
@@ -979,7 +979,9 @@ class GOBLIN:
                     cache_dir=(self.cache_dir / f"apspd/lingauss/{self.dataset_name}"),
                 )
             elif op.family == "heat":
-                tau, key = op.param, (tuple(splits), op.param)
+                tausqrt = op.param
+                tau = tausqrt**2
+                key = (tuple(splits), tau)  # cache keyed by actual τ, matching eval_accuracy_lin_heat
                 # Load if cached
                 if key in self._lin_heat_cache:
                     Yhat_expert = self._lin_heat_cache[key]

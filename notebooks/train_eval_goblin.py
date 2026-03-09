@@ -1,4 +1,5 @@
 import argparse
+import dataclasses
 import numpy as np
 import hashlib
 import json
@@ -19,6 +20,7 @@ from goblin.data import (
     build_hopsign_dataset,
     build_and_cache_distance_operators,
     build_and_cache_city_distance_operators,
+    compute_mean_spd,
 )
 
 hopsign_cache_dir = DATA_CACHE / "goblin_khopsign"
@@ -42,14 +44,17 @@ hparams = {
     "sigma": 0.5,
     "search_min_sep_mu": 0.2,
     "basis_min_sep_mu": 0.5,
-    # LinHeat
-    "tau_min": 0.0,
-    "tau_max": 5.0,
-    "tau_num": 50,
-    "search_min_sep_tau": 0.1,
-    "basis_min_sep_tau": 1.0,
+    # LinHeat (search is over tausqrt = sqrt(tau))
+    "tausqrt_min": 0.0,
+    "tausqrt_max": 5.0,
+    "tausqrt_num": 50,
+    "search_min_sep_tausqrt": 0.1,
+    "basis_min_sep_tausqrt": 1.0,
     "num_fixed_operators": 1,
     "fixed_operators": ["L1"],
+    # Adaptive search bounds (0 = use fixed bounds; >0 = scale by mean SPD)
+    "mu_max_spd_sf": 0.0,       # mu_max      = mu_max_spd_sf      * mean_SPD (or mu_max      if 0)
+    "tausqrt_max_spd_sf": 0.0,  # tausqrt_max = tausqrt_max_spd_sf * mean_SPD (or tausqrt_max if 0)
     # GP
     "rbf_length_scale": 1.0,
     "white_noise": 0.2,
@@ -67,8 +72,13 @@ hparams = {
 
 _parser = argparse.ArgumentParser()
 _parser.add_argument("--eval_dataset", type=str, default=None)
-_parser.add_argument("--train_dataset", type=str, default=None)
-_parser.add_argument("--seed", type=int, default=None)
+for _key, _val in hparams.items():
+    if isinstance(_val, bool):
+        _parser.add_argument(f"--{_key}", type=lambda x: x.lower() in ('true', '1', 'yes'), default=None)
+    elif isinstance(_val, list):
+        _parser.add_argument(f"--{_key}", nargs='+', default=None)
+    else:
+        _parser.add_argument(f"--{_key}", type=type(_val), default=None)
 _args, _ = _parser.parse_known_args()
 
 eval_ds = [
@@ -83,7 +93,7 @@ eval_ds = [
     # "8HopSign",
     #
     # # Benchmarks
-    # "AirBrazil",
+    "AirBrazil",
     # "AirUS",
     # "AirEU",
     # "Cornell",
@@ -110,7 +120,7 @@ eval_ds = [
     # "Questions",
     #
     # CityNetworks
-    "CityParis",
+    # "CityParis",
     # "CityShanghai",
     # "CityLA",
     # "CityLondon",
@@ -119,13 +129,11 @@ eval_ds = [
 if _args.eval_dataset is not None:
     eval_ds = [_args.eval_dataset]
 
-p = hparams
-if _args.train_dataset is not None:
-    p = dict(hparams)
-    p["train_ds"] = _args.train_dataset
-if _args.seed is not None:
-    p = dict(p)
-    p["seed"] = _args.seed
+p = dict(hparams)
+for _key in hparams:
+    _val = getattr(_args, _key)
+    if _val is not None:
+        p[_key] = _val
 hparam_str = json.dumps(p, sort_keys=True)
 hparam_hash = hashlib.md5(hparam_str.encode()).hexdigest()
 
@@ -165,17 +173,25 @@ else:
         cache_dir=lingauss_cache_dir / p["train_ds"],
     )
 
+_train_mean_spd = compute_mean_spd(
+    all_pairs_dist,
+    cache_dir=lingauss_cache_dir / p["train_ds"] if all_pairs_dist is None else None,
+)
+_train_mu_max = p["mu_max_spd_sf"] * _train_mean_spd if p["mu_max_spd_sf"] > 0 else p["mu_max"]
+_train_tausqrt_max = p["tausqrt_max_spd_sf"] * _train_mean_spd if p["tausqrt_max_spd_sf"] > 0 else p["tausqrt_max"]
+print(f"Train mean SPD: {_train_mean_spd:.3f} → mu_max={_train_mu_max:.3f}, tausqrt_max={_train_tausqrt_max:.3f}")
+
 operator_cfg = OperatorSearchConfig(
     families=["heat", "gaussian"],
     bo_objective=p["bo_objective"],
     num_explore_steps=p["num_explore_steps"],
     num_exploit_steps=p["num_exploit_steps"],
     mu_min=p["mu_min"],
-    mu_max=p["mu_max"],
+    mu_max=_train_mu_max,
     mu_num=p["mu_num"],
-    tau_min=p["tau_min"],
-    tau_max=p["tau_max"],
-    tau_num=p["tau_num"],
+    tausqrt_min=p["tausqrt_min"],
+    tausqrt_max=_train_tausqrt_max,
+    tausqrt_num=p["tausqrt_num"],
     rbf_length_scale=p["rbf_length_scale"],
     white_noise=p["white_noise"],
 )
@@ -185,7 +201,7 @@ multi_search_cfg = MultiSearchConfig(
     mix_strategy=p["mix_strategy"],
     basis_size=p["basis_size"],
     basis_min_sep_mu=p["basis_min_sep_mu"],
-    basis_min_sep_tau=p["basis_min_sep_tau"],
+    basis_min_sep_tausqrt=p["basis_min_sep_tausqrt"],
     bias_prob=p["bias_prob"],
     enforce_family_coverage=p["enforce_family_coverage"],
     include_fixed_ops=p["fixed_operators"],
@@ -258,6 +274,10 @@ for k in tqdm(range(1, int(p["mu_max"]) + 1)):
         cache_dir=hopsign_cache_dir / ds_name,
     )
 
+    _mean_spd = compute_mean_spd(test_dataset["all_pairs_dist"])
+    _mu_max = p["mu_max_spd_sf"] * _mean_spd if p["mu_max_spd_sf"] > 0 else p["mu_max"]
+    _tausqrt_max = p["tausqrt_max_spd_sf"] * _mean_spd if p["tausqrt_max_spd_sf"] > 0 else p["tausqrt_max"]
+
     eval_goblin = GOBLIN(
         data=test_dataset["data"],
         X=test_dataset["X"],
@@ -267,7 +287,7 @@ for k in tqdm(range(1, int(p["mu_max"]) + 1)):
         splits=test_dataset["splits"],
         sigma=p["sigma"],
         C=2,
-        operator_search_cfg=operator_cfg,
+        operator_search_cfg=dataclasses.replace(operator_cfg, mu_max=_mu_max, tausqrt_max=_tausqrt_max),
         multi_search_cfg=multi_search_cfg,
         deepset_cfg=deepset_cfg,
         seed=p["seed"],
@@ -309,6 +329,13 @@ for ds in tqdm(eval_ds):
             cache_dir=lingauss_cache_dir / ds,
         )
 
+    _mean_spd = compute_mean_spd(
+        all_pairs_dist,
+        cache_dir=lingauss_cache_dir / ds if all_pairs_dist is None else None,
+    )
+    _mu_max = p["mu_max_spd_sf"] * _mean_spd if p["mu_max_spd_sf"] > 0 else p["mu_max"]
+    _tausqrt_max = p["tausqrt_max_spd_sf"] * _mean_spd if p["tausqrt_max_spd_sf"] > 0 else p["tausqrt_max"]
+
     eval_goblin = GOBLIN(
         data=data,
         X=X,
@@ -318,7 +345,7 @@ for ds in tqdm(eval_ds):
         splits=splits,
         sigma=p["sigma"],
         C=C,
-        operator_search_cfg=operator_cfg,
+        operator_search_cfg=dataclasses.replace(operator_cfg, mu_max=_mu_max, tausqrt_max=_tausqrt_max),
         multi_search_cfg=multi_search_cfg,
         deepset_cfg=deepset_cfg,
         seed=p["seed"],
