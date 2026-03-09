@@ -42,14 +42,13 @@ hparams = {
     "mu_max": 8.0,
     "mu_num": 250,
     "sigma": 0.5,
-    "search_min_sep_mu": 0.2,
-    "basis_min_sep_mu": 0.5,
     # LinHeat (search is over tausqrt = sqrt(tau))
     "tausqrt_min": 0.0,
     "tausqrt_max": 5.0,
     "tausqrt_num": 50,
-    "search_min_sep_tausqrt": 0.1,
-    "basis_min_sep_tausqrt": 1.0,
+    "diversity_lambda": 0.0,  # λ for greedy_diversity rule (0 = pure top-k)
+    "mu_anchor": 1.0,         # gaussian family initial GP sample (None = disable)
+    "tausqrt_anchor": 1.5,    # heat family initial GP sample (None = disable)
     "num_fixed_operators": 1,
     "fixed_operators": ["L1"],
     # Adaptive search bounds (0 = use fixed bounds; >0 = scale by mean SPD)
@@ -201,12 +200,13 @@ multi_search_cfg = MultiSearchConfig(
     total_steps=(p["num_explore_steps"] + p["num_exploit_steps"]),
     mix_strategy=p["mix_strategy"],
     basis_size=p["basis_size"],
-    basis_min_sep_mu=p["basis_min_sep_mu"],
-    basis_min_sep_tausqrt=p["basis_min_sep_tausqrt"],
     bias_prob=p["bias_prob"],
     enforce_family_coverage=p["enforce_family_coverage"],
     include_fixed_ops=p["fixed_operators"],
     basis_selection_rule=p["basis_selection_rule"],
+    diversity_lambda=p["diversity_lambda"],
+    mu_anchor=p["mu_anchor"],
+    tausqrt_anchor=p["tausqrt_anchor"],
 )
 
 deepset_cfg = ExpertsDeepSetConfig(

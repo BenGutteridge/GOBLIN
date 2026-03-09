@@ -85,13 +85,11 @@ class OperatorSearchConfig:
     mu_min: float = 0.0
     mu_max: float = 10.0
     mu_num: int = 250
-    search_min_sep_mu: float = 0.2
 
     # LinHeat (search is over tausqrt = sqrt(tau); eval squares before passing to kernel)
     tausqrt_min: float = 0.0
     tausqrt_max: float = 2.5
     tausqrt_num: int = 50
-    search_min_sep_tausqrt: float = 0.1
 
     # GP settings
     rbf_length_scale: float = 1.0
@@ -110,12 +108,13 @@ class MultiSearchConfig:
     total_steps: int  # total BO steps across both families
     mix_strategy: str  # "balanced" | "biased" | "adaptive"
     basis_size: int
-    basis_min_sep_mu: float
-    basis_min_sep_tausqrt: float
     basis_selection_rule: str
     bias_prob: float = 0.5  # used for bias strategies
     enforce_family_coverage: bool = False  # when picking final basis
     include_fixed_ops: list[str] = None  # e.g. ["X", "L1", "H1"]
+    diversity_lambda: float = 0.0  # λ for greedy_diversity rule (0 = pure top-k)
+    mu_anchor: float | None = 1.0       # gaussian family initial GP sample (None = disable)
+    tausqrt_anchor: float | None = 1.5  # heat family initial GP sample (None = disable)
 
 
 class MultiOperatorSearch:
@@ -184,6 +183,26 @@ class MultiOperatorSearch:
                 self.sampled_ops.append(op)
                 self.sampled_scores[op] = acc
 
+        # ---- Inject informed initial samples ----
+        # These replace the default param_grid[0]=0 GP initialisation with
+        # more informative starting points (configurable via mu_anchor / tausqrt_anchor).
+        _anchors = {"gaussian": self.cfg.mu_anchor, "heat": self.cfg.tausqrt_anchor}
+        for fam_name, anchor_param in _anchors.items():
+            if anchor_param is None:
+                continue
+            if fam_name not in self.searches:
+                continue
+            search = self.searches[fam_name]
+            acc_std = search.family.eval_fn(float(anchor_param), standardized=True)
+            acc_raw = search.family.eval_fn(float(anchor_param), standardized=False)
+            # Replace default GP initialisation with this anchor
+            search.param_obs = [float(anchor_param)]
+            search.y_obs = [-acc_std]
+            # Add to candidate pool for basis selection
+            op = OpId(fam_name, float(anchor_param))
+            self.sampled_ops.append(op)
+            self.sampled_scores[op] = acc_raw
+
         # ---- BO loop ----
         for t in tqdm(range(self.cfg.total_steps)):
             fam = self._choose_family(t)
@@ -227,28 +246,10 @@ class MultiOperatorSearch:
                 chosen.append(op)
                 basis_size += 1
 
-        def ok_sep(op: OpId) -> bool:
-            if op.family not in self.searches:
-                return True
-            for c in chosen:
-                if c.family != op.family:
-                    continue
-                dist = abs(float(c.param) - float(op.param))
-                min_sep = (
-                    self.cfg.basis_min_sep_tausqrt
-                    if op.family == "heat"
-                    else self.cfg.basis_min_sep_mu
-                )
-                if dist < min_sep:
-                    return False
-            return True
-
         for op, _ in ranked:
             if len(chosen) >= basis_size:
                 break
             if op in chosen:
-                continue
-            if not ok_sep(op):
                 continue
             chosen.append(op)
 
@@ -261,6 +262,49 @@ class MultiOperatorSearch:
                     repl = next((o for o, _ in ranked if o.family == fam), None)
                     if repl is not None:
                         chosen[-1] = repl
+
+        # stable dedupe
+        out, seen = [], set()
+        for o in chosen:
+            if o not in seen:
+                out.append(o)
+                seen.add(o)
+        return out
+
+
+    def select_greedy_diversity_basis(self) -> list[OpId]:
+        """Greedy basis selection penalizing cosine similarity of Y_L^eval predictions."""
+        lam = self.cfg.diversity_lambda
+        eval_idxs = self.goblin.splits["train_eval"]
+
+        def get_pred_vec(op: OpId) -> torch.Tensor | None:
+            yhat_full = self.goblin._get_op_yhat_bo(op)  # (N, C)
+            flat = yhat_full[eval_idxs].reshape(-1).float()
+            norm = flat.norm()
+            return flat / norm if norm > 1e-12 else None
+
+        pred_vecs = {op: get_pred_vec(op) for op in self.sampled_ops}
+
+        # Fixed ops always in basis first
+        chosen = [op for op in self.sampled_ops if op.family == "fixed"]
+        remaining = [op for op in self.sampled_ops if op.family != "fixed"]
+        total_size = self.cfg.basis_size + len(chosen)
+
+        while len(chosen) < total_size and remaining:
+            best_op, best_score = None, -float("inf")
+            for op in remaining:
+                score = self.sampled_scores[op]
+                if lam > 0 and pred_vecs[op] is not None:
+                    chosen_vecs = [pred_vecs[c] for c in chosen if pred_vecs.get(c) is not None]
+                    if chosen_vecs:
+                        sims = [float((pred_vecs[op] * v).sum()) for v in chosen_vecs]
+                        score -= lam * max(sims)
+                if score > best_score:
+                    best_score, best_op = score, op
+            if best_op is None:
+                break
+            chosen.append(best_op)
+            remaining.remove(best_op)
 
         # stable dedupe
         out, seen = [], set()
@@ -433,21 +477,7 @@ class OperatorSearch:
 
         for idx in sorted_idx:
             param_candidate = float(self.param_grid[idx])
-
-            # skip if already sampled
-            if any(np.isclose(param_candidate, self.param_obs, atol=1e-6)):
-                continue
-
-            # spacing among exploit points
-            min_sep = (
-                self.cfg.search_min_sep_tausqrt
-                if self.family.name == "heat"
-                else self.cfg.search_min_sep_mu
-            )
-            if all(
-                abs(param_candidate - param_prev) >= min_sep
-                for param_prev in self.selected_exploit
-            ):
+            if not any(np.isclose(param_candidate, self.param_obs, atol=1e-6)):
                 return param_candidate
 
         # fallback: reuse best (may already be sampled)
@@ -965,6 +995,8 @@ class GOBLIN:
         """
         if self.basis_selection_rule == "diverse_top_k":
             basis = self.multi_search.select_mixed_basis()
+        elif self.basis_selection_rule == "greedy_diversity":
+            basis = self.multi_search.select_greedy_diversity_basis()
         else:
             raise ValueError(
                 f"Unknown basis selection rule: {self.basis_selection_rule}"
