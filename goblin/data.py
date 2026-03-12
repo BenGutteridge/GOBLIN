@@ -113,6 +113,18 @@ def build_and_cache_city_distance_operators(
         torch.save(M_k, path)
         print(f"Saved dist={k}, nnz={M_k._nnz()}")
 
+    # Write sentinel (same as build_and_cache_distance_operators)
+    sentinel_path = os.path.join(cache_dir, ".built_max_dist")
+    existing = 0
+    if os.path.exists(sentinel_path):
+        try:
+            existing = int(open(sentinel_path).read().strip())
+        except Exception:
+            pass
+    if max_k > existing:
+        with open(sentinel_path, "w") as f:
+            f.write(str(max_k))
+
     print("Done.")
 
 
@@ -196,6 +208,18 @@ def compute_mean_spd(
     return total_dist / total_count
 
 
+def recommended_max_dist(mean_spd: float) -> int:
+    """
+    Return the maximum distance to cache in M_dist_k files.
+
+    Covers mu values up to 2 * mean_spd (the largest reasonable spd_scale_factor
+    is ~1.5, so mu_max ≤ 1.5 * mean_spd; we add headroom to ~2x).
+    Gaussian weight_cutoff=0.01 with sigma=0.5 means only distances within
+    ~1.5 of mu matter, so we round up and cap at 20.
+    """
+    return min(20, max(10, int(np.ceil(2 * mean_spd)) + 2))
+
+
 def build_and_cache_distance_operators(
     apspd: torch.Tensor,  # (N, N) int, CPU
     max_dist: int,
@@ -230,6 +254,20 @@ def build_and_cache_distance_operators(
         torch.save(M_d, path)
 
         print(f"Saved dist={d}, nnz={M_d._nnz()}")
+
+    # Write sentinel so load_graph_dataset can skip APSPD load on future runs,
+    # even when the graph diameter is smaller than max_dist (so M_dist_{max_dist}.pt
+    # was never written because no pairs exist at that distance).
+    sentinel_path = os.path.join(cache_dir, ".built_max_dist")
+    existing = 0
+    if os.path.exists(sentinel_path):
+        try:
+            existing = int(open(sentinel_path).read().strip())
+        except Exception:
+            pass
+    if max_dist > existing:
+        with open(sentinel_path, "w") as f:
+            f.write(str(max_dist))
 
     print("Done.")
 
@@ -326,7 +364,7 @@ def apply_lin_gaussian_operator(
 
     # Precompute Gaussian weights (cheap)
     # We only load matrices that exist on disk
-    for fname in os.listdir(cache_dir):
+    for fname in sorted(os.listdir(cache_dir)):
         if not fname.startswith("M_dist_"):
             continue
 
@@ -667,6 +705,21 @@ def extract_mask(mask: torch.Tensor, split_idx: int = 0) -> torch.Tensor:
 
 # --------- Main loader ---------------
 
+def _load_or_compute_apspd(name: str, data, N: int, cache_dir: Path) -> torch.Tensor:
+    """Load APSPD from disk cache if available, otherwise compute it via BFS."""
+    apspd_filepath = cache_dir / f"apspd/{name}_apspd.pt"
+    if apspd_filepath.exists():
+        print(f"Loading cached all pairs shortest path distances for {name}...")
+        all_pairs_dist = torch.load(str(apspd_filepath), weights_only=True)["spd"]
+        if all_pairs_dist.shape[0] == N**2:
+            all_pairs_dist = all_pairs_dist.reshape(N, N)
+        assert all_pairs_dist.shape == (N, N)
+        print(f"Loaded cached all pairs shortest path distances for {name}.")
+    else:
+        print(f"Computing all pairs shortest path distances for {name}...")
+        all_pairs_dist = apspd_to_tensor(data)
+    return all_pairs_dist
+
 
 def load_graph_dataset(
     name: str,
@@ -830,17 +883,29 @@ def load_graph_dataset(
     # -----------------------------
     if compute_all_pairs_dist:
         N = X.shape[0]
-        apspd_filepath = cache_dir / f"apspd/{name}_apspd.pt"
-        if apspd_filepath.exists():
-            print(f"Loading cached all pairs shortest path distances for {name}...")
-            all_pairs_dist = torch.load(str(apspd_filepath))["spd"]
-            if all_pairs_dist.shape[0] == N**2:
-                all_pairs_dist = all_pairs_dist.reshape(N, N)
-            assert all_pairs_dist.shape == (N, N)
-            print(f"Loaded cached all pairs shortest path distances for {name}.")
+        lingauss_cache = cache_dir / f"apspd/lingauss/{name}"
+        # If M_dist_k cache already exists and is deep enough, skip loading the
+        # full (potentially multi-GB) APSPD tensor — apply_lin_gaussian_operator
+        # reads M_dist_k files directly and never needs the raw APSPD tensor.
+        all_pairs_dist = None
+        sentinel = lingauss_cache / ".built_max_dist"
+        if sentinel.exists():
+            mean_spd_est = compute_mean_spd(None, cache_dir=lingauss_cache)
+            required_max = recommended_max_dist(mean_spd_est)
+            built_max = int(sentinel.read_text().strip())
+            if built_max >= required_max:
+                print(f"M_dist_k cache sufficient (built_max={built_max} ≥ {required_max}) for {name} — skipping full APSPD load.")
+            else:
+                # Cache exists but was built with a smaller max_dist — extend it
+                print(f"M_dist_k cache built_max={built_max} < {required_max} for {name} — loading APSPD to extend.")
+                all_pairs_dist = _load_or_compute_apspd(name, data, N, cache_dir)
+        elif (lingauss_cache / "M_dist_1.pt").exists():
+            # Legacy cache without sentinel — conservative: load APSPD to rebuild
+            print(f"M_dist_k cache has no sentinel for {name} — loading APSPD to rebuild with dynamic max_dist.")
+            all_pairs_dist = _load_or_compute_apspd(name, data, N, cache_dir)
         else:
-            print(f"Computing all pairs shortest path distances for {name}...")
-            all_pairs_dist = apspd_to_tensor(data)
+            # No cache at all — first run, must load APSPD to build it
+            all_pairs_dist = _load_or_compute_apspd(name, data, N, cache_dir)
     else:
         all_pairs_dist = None
 

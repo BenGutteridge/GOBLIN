@@ -52,6 +52,34 @@ def _as_float_list(x):
     return [float(v) for v in x]
 
 
+def _resolve_anchors(
+    anchor_spec: float | list | int | None,
+    grid: np.ndarray,
+) -> list[float]:
+    """Convert an anchor specification to a list of float parameter values.
+
+    Args:
+        anchor_spec:
+            None        → no anchors (empty list)
+            float       → single anchor at that value
+            list[float] → explicit anchor positions
+            int (n > 0) → n equally-spaced anchors interior to [grid.min, grid.max]
+        grid: the parameter grid (used only when anchor_spec is an int)
+    """
+    if anchor_spec is None:
+        return []
+    if isinstance(anchor_spec, int):
+        n = anchor_spec
+        if n <= 0:
+            return []
+        lo, hi = float(grid.min()), float(grid.max())
+        # n interior points; excludes the exact endpoints via linspace(lo, hi, n+2)[1:-1]
+        return list(np.linspace(lo, hi, n + 2)[1:-1])
+    if isinstance(anchor_spec, (list, tuple)):
+        return [float(v) for v in anchor_spec]
+    return [float(anchor_spec)]
+
+
 @dataclass
 class OperatorFamily:
     name: str  # "gaussian" or "heat"
@@ -110,8 +138,14 @@ class MultiSearchConfig:
     enforce_family_coverage: bool = False  # when picking final basis
     include_fixed_ops: list[str] = None  # e.g. ["X", "L1", "H1"]
     diversity_lambda: float = 0.0  # λ for greedy_diversity rule (0 = pure top-k)
-    mu_anchor: float | None = 1.0       # gaussian family initial GP sample (None = disable)
-    tausqrt_anchor: float | None = 1.5  # heat family initial GP sample (None = disable)
+    # Anchor specifications for each family.
+    # Accepted types:
+    #   None          → no anchors for this family
+    #   float         → single anchor at that parameter value
+    #   list[float]   → explicit anchor positions (each counts as one sample)
+    #   int (n > 0)   → n equally-spaced anchors interior to the resolved parameter range
+    mu_anchors: float | list | int | None = 1.0       # gaussian family anchors
+    tausqrt_anchors: float | list | int | None = 1.5  # heat family anchors
     sampling_strategy: str = "cross_family_ucb"  # "cross_family_ucb" | "per_family"
 
 
@@ -147,26 +181,45 @@ class MultiOperatorSearch:
 
         # ---- Anchor initial observations ----
         # Evaluated before the UCB loop; fed into each GP as its first observation.
+        # All anchors count toward n_samples.
         n_anchors = 0
-        _anchors = {"gaussian": self.cfg.mu_anchor, "heat": self.cfg.tausqrt_anchor}
-        for fam_name, anchor_param in _anchors.items():
-            if anchor_param is None:
-                continue
+        _anchor_specs = {"gaussian": self.cfg.mu_anchors, "heat": self.cfg.tausqrt_anchors}
+        for fam_name, anchor_spec in _anchor_specs.items():
             if fam_name not in self.searches:
                 continue
             search = self.searches[fam_name]
-            acc_std = search.family.eval_fn(float(anchor_param), standardized=True)
-            acc_raw = search.family.eval_fn(float(anchor_param), standardized=False)
-            search.param_obs = [float(anchor_param)]
-            search.y_obs = [-acc_std]
-            op = OpId(fam_name, float(anchor_param))
-            self.sampled_ops.append(op)
-            self.sampled_scores[op] = acc_raw
-            n_anchors += 1
+            anchor_params = _resolve_anchors(anchor_spec, search.family.grid)
+            if not anchor_params:
+                continue
+            lo, hi = float(search.family.grid.min()), float(search.family.grid.max())
+            oob = [p for p in anchor_params if p < lo or p > hi]
+            if oob:
+                warnings.warn(
+                    f"{fam_name} anchors {oob} are outside the search grid [{lo:.3g}, {hi:.3g}]; "
+                    "they will inform the GP but cannot be re-queried by UCB.",
+                    stacklevel=2,
+                )
+            acc_stds = [search.family.eval_fn(p, standardized=True) for p in anchor_params]
+            acc_raws = [search.family.eval_fn(p, standardized=False) for p in anchor_params]
+            # Replace the default GP initialization with the anchor observations
+            search.param_obs = list(anchor_params)
+            search.y_obs = [-s for s in acc_stds]
+            for p, acc_raw in zip(anchor_params, acc_raws):
+                op = OpId(fam_name, float(p))
+                self.sampled_ops.append(op)
+                self.sampled_scores[op] = acc_raw
+                n_anchors += 1
 
         # ---- UCB loop ----
         beta = self.goblin.operator_search_cfg.ucb_beta
         n_ucb_steps = self.cfg.n_samples - n_anchors
+        if n_ucb_steps < 0:
+            warnings.warn(
+                f"n_anchors ({n_anchors}) exceeds n_samples ({self.cfg.n_samples}); "
+                "UCB loop will be skipped. Increase n_samples or reduce anchor count.",
+                stacklevel=2,
+            )
+            n_ucb_steps = 0
 
         if self.cfg.sampling_strategy == "per_family":
             # Each family gets an independent UCB budget; no cross-family competition.

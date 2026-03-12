@@ -21,6 +21,7 @@ from goblin.data import (
     build_and_cache_distance_operators,
     build_and_cache_city_distance_operators,
     compute_mean_spd,
+    recommended_max_dist,
 )
 
 hopsign_cache_dir = DATA_CACHE / "goblin_khopsign"
@@ -45,8 +46,8 @@ hparams = {
     "tausqrt_max": 5.0,
     "tausqrt_num": 50,
     "diversity_lambda": 0.2,  # λ for greedy_diversity rule (0 = pure top-k)
-    "mu_anchor": 1.0,         # gaussian family initial GP sample (None = disable)
-    "tausqrt_anchor": 1.5,    # heat family initial GP sample (None = disable)
+    "mu_anchors": 1.0,         # gaussian family anchors: float, list[float], int (N auto-spaced), or None
+    "tausqrt_anchors": 1.5,   # heat family anchors: float, list[float], int (N auto-spaced), or None
     "num_fixed_operators": 1,
     "fixed_operators": ["L1"],
     # Adaptive search bounds (0 = use fixed bounds; >0 = scale by mean SPD)
@@ -170,11 +171,13 @@ if p["train_ds"] in CITY_DATASETS:
     build_and_cache_city_distance_operators(
         city_name=p["train_ds"],
         cache_dir=lingauss_cache_dir / p["train_ds"],
+        max_k=20,
     )
-else:
+elif all_pairs_dist is not None:  # None means M_dist_k cache already sufficient
+    _train_mean_spd_for_cache = compute_mean_spd(all_pairs_dist)
     build_and_cache_distance_operators(
         all_pairs_dist,
-        max_dist=10,
+        max_dist=recommended_max_dist(_train_mean_spd_for_cache),  # previously set to 10
         cache_dir=lingauss_cache_dir / p["train_ds"],
     )
 
@@ -207,8 +210,8 @@ multi_search_cfg = MultiSearchConfig(
     include_fixed_ops=p["fixed_operators"],
     basis_selection_rule=p["basis_selection_rule"],
     diversity_lambda=p["diversity_lambda"],
-    mu_anchor=p["mu_anchor"],
-    tausqrt_anchor=p["tausqrt_anchor"],
+    mu_anchors=p["mu_anchors"],
+    tausqrt_anchors=p["tausqrt_anchors"],
 )
 
 deepset_cfg = ExpertsDeepSetConfig(
@@ -281,13 +284,12 @@ for k in tqdm(range(1, int(p["mu_max"]) + 1)):
         label_noise=label_noise,
     )
 
+    _mean_spd = compute_mean_spd(test_dataset["all_pairs_dist"])
     build_and_cache_distance_operators(
         test_dataset["all_pairs_dist"],
-        max_dist=10,
+        max_dist=recommended_max_dist(_mean_spd),  # previously set to 10
         cache_dir=hopsign_cache_dir / ds_name,
     )
-
-    _mean_spd = compute_mean_spd(test_dataset["all_pairs_dist"])
     _mu_max = p["mu_max_spd_sf"] * _mean_spd if p["mu_max_spd_sf"] > 0 else p["mu_max"]
     _tausqrt_max = p["tausqrt_max_spd_sf"] * _mean_spd if p["tausqrt_max_spd_sf"] > 0 else p["tausqrt_max"]
 
@@ -334,11 +336,13 @@ for ds in tqdm(eval_ds):
         build_and_cache_city_distance_operators(
             city_name=ds,
             cache_dir=lingauss_cache_dir / ds,
+            max_k=20,
         )
-    else:
+    elif all_pairs_dist is not None:  # None means M_dist_k cache already sufficient
+        _mean_spd_for_cache = compute_mean_spd(all_pairs_dist)
         build_and_cache_distance_operators(
             all_pairs_dist,
-            max_dist=10,
+            max_dist=recommended_max_dist(_mean_spd_for_cache),  # previously set to 10
             cache_dir=lingauss_cache_dir / ds,
         )
 
