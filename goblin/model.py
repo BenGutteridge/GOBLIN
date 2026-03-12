@@ -112,6 +112,7 @@ class MultiSearchConfig:
     diversity_lambda: float = 0.0  # λ for greedy_diversity rule (0 = pure top-k)
     mu_anchor: float | None = 1.0       # gaussian family initial GP sample (None = disable)
     tausqrt_anchor: float | None = 1.5  # heat family initial GP sample (None = disable)
+    sampling_strategy: str = "cross_family_ucb"  # "cross_family_ucb" | "per_family"
 
 
 class MultiOperatorSearch:
@@ -164,27 +165,40 @@ class MultiOperatorSearch:
             n_anchors += 1
 
         # ---- UCB loop ----
-        # At each step, compute UCB across all families and sample the most promising.
-        # UCB values are in standardized accuracy space (comparable across families).
         beta = self.goblin.operator_search_cfg.ucb_beta
         n_ucb_steps = self.cfg.n_samples - n_anchors
-        for _ in tqdm(range(n_ucb_steps)):
-            best_params: dict[str, float] = {}
-            best_acqs: dict[str, float] = {}
-            for fam_name, search in self.searches.items():
-                param, acq_val = search.suggest_ucb(beta)
-                best_params[fam_name] = param
-                best_acqs[fam_name] = acq_val
 
-            fam = max(best_acqs, key=best_acqs.get)
-            param_next = best_params[fam]
-            search = self.searches[fam]
+        if self.cfg.sampling_strategy == "per_family":
+            # Each family gets an independent UCB budget; no cross-family competition.
+            # Prevents a lucky anchor in one family from starving the other.
+            active = list(self.searches.items())
+            base, rem = divmod(n_ucb_steps, len(active))
+            for i, (fam_name, search) in enumerate(active):
+                for _ in tqdm(range(base + (1 if i < rem else 0))):
+                    param, _ = search.suggest_ucb(beta)
+                    search.observe("ucb", param)
+                    op = OpId(fam_name, float(param))
+                    self.sampled_ops.append(op)
+                    self.sampled_scores[op] = search.family.eval_fn(float(param), standardized=False)
+        else:
+            # Cross-family UCB: all families compete for the shared sample budget.
+            for _ in tqdm(range(n_ucb_steps)):
+                best_params: dict[str, float] = {}
+                best_acqs: dict[str, float] = {}
+                for fam_name, search in self.searches.items():
+                    param, acq_val = search.suggest_ucb(beta)
+                    best_params[fam_name] = param
+                    best_acqs[fam_name] = acq_val
 
-            search.observe("ucb", param_next)
-            op = OpId(fam, float(param_next))
-            acc = search.family.eval_fn(float(param_next), standardized=False)
-            self.sampled_ops.append(op)
-            self.sampled_scores[op] = acc
+                fam = max(best_acqs, key=best_acqs.get)
+                param_next = best_params[fam]
+                search = self.searches[fam]
+
+                search.observe("ucb", param_next)
+                op = OpId(fam, float(param_next))
+                acc = search.family.eval_fn(float(param_next), standardized=False)
+                self.sampled_ops.append(op)
+                self.sampled_scores[op] = acc
 
         return self.sampled_ops, self.sampled_scores
 
@@ -414,6 +428,7 @@ class OperatorSearch:
 
     # ---- selection rules ----
     def _fit_gp(self):
+        """Fit GP on self.y_obs."""
         gp = GaussianProcessRegressor(kernel=self.kernel, normalize_y=True)
         gp.fit(np.array(self.param_obs).reshape(-1, 1), np.array(self.y_obs))
         gp_mean, gp_std = gp.predict(self.param_grid.reshape(-1, 1), return_std=True)
@@ -459,6 +474,8 @@ class ExpertsDeepSetConfig:
     log_every: int = 200
     dropout: float = 0.0  # TODO implement
     score_feature: str = "none"  # "none" | "trimmed" | "trimmed_and_lower_half"
+    weight_selection: str = "current"  # "current" | "pre_filter" | "mask_by_deepset"
+    feature_set_size: str = "all"      # "all" | "top_half" | "basis_size"; ignored when weight_selection == "current"
     # stochastic training mode
     n_batches: int = 1000
     batch_size: int = 128
@@ -548,6 +565,38 @@ class ExpertsDeepSet(nn.Module):
             H = torch.cat([H, sf], dim=-1)
         return H
 
+    @staticmethod
+    def _apply_weight_selection(
+        alpha: torch.Tensor,            # (N, M)
+        Yhat_N: torch.Tensor,           # (N, M, C)
+        basis_indices: list[int] | None,
+        k_mask: int | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Post-process alpha for weight selection.
+
+        Returns (Yhat_bar (N,C), alpha_eff (N,k_eff)):
+          - pre_filter (basis_indices set): k_eff = len(basis_indices)
+          - mask_by_deepset (k_mask set):  k_eff = k_mask (zeros for non-selected)
+          - current (neither set):         k_eff = M (no change)
+        """
+        if basis_indices is not None:
+            idx = torch.tensor(basis_indices, device=alpha.device)
+            alpha_k = alpha[:, idx]
+            alpha_k = alpha_k / alpha_k.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            Yhat_bar = (alpha_k.unsqueeze(-1) * Yhat_N[:, idx]).sum(dim=1)
+            return Yhat_bar, alpha_k
+        elif k_mask is not None:
+            k = min(k_mask, alpha.shape[1])
+            topk_idx = alpha.topk(k, dim=1).indices
+            mask = torch.zeros_like(alpha).scatter_(1, topk_idx, 1.0)
+            alpha_m = alpha * mask
+            alpha_m = alpha_m / alpha_m.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            Yhat_bar = (alpha_m.unsqueeze(-1) * Yhat_N).sum(dim=1)
+            return Yhat_bar, alpha_m
+        else:
+            Yhat_bar = (alpha.unsqueeze(-1) * Yhat_N).sum(dim=1)
+            return Yhat_bar, alpha
+
     def train_model(
         self,
         Yhat: torch.Tensor,
@@ -556,6 +605,8 @@ class ExpertsDeepSet(nn.Module):
         *,
         score_feat: torch.Tensor | None = None,
         verbose: bool = True,
+        basis_indices: list[int] | None = None,
+        k_mask: int | None = None,
     ) -> list[float]:
         """
         Train on given train_idx split (should be train_eval, with Yhat solved from from train_fit).
@@ -568,7 +619,7 @@ class ExpertsDeepSet(nn.Module):
         for epoch in range(self.cfg.epochs):
             self.train()
             alpha = self(H[train_idx])
-            Yhat_bar = (alpha.unsqueeze(-1) * Yhat[train_idx]).sum(dim=1)
+            Yhat_bar, _ = self._apply_weight_selection(alpha, Yhat[train_idx], basis_indices, k_mask)
 
             loss = self.loss_fn(Yhat_bar, y_class[train_idx])
             # loss = F.nll_loss((Yhat_bar + 1e-8).log(), y_class[train_idx])
@@ -594,19 +645,24 @@ class ExpertsDeepSet(nn.Module):
         splits: dict[str, torch.Tensor],
         *,
         score_feat: torch.Tensor | None = None,
+        basis_indices: list[int] | None = None,
+        k_mask: int | None = None,
     ) -> dict[str, float]:
         self.eval()
         H = self.build_features(Yhat, score_feat)
         res = {}
         for split, split_idx in splits.items():
             alpha_eval = self(H[split_idx])
-            Yhat_bar = (alpha_eval.unsqueeze(dim=-1) * Yhat[split_idx]).sum(dim=1)
+            Yhat_bar, alpha_eff = self._apply_weight_selection(
+                alpha_eval, Yhat[split_idx], basis_indices, k_mask
+            )
             preds = Yhat_bar.argmax(dim=1)
             acc = (preds == y_class[split_idx]).float().mean().item()
             res[f"{split}/acc"] = acc
-            res[f"{split}/mean_alpha"] = alpha_eval.mean(dim=0).cpu()
-            for expert_idx in range(Yhat.shape[1]):
-                expert_pred = Yhat[:, expert_idx][split_idx].argmax(dim=1)
+            res[f"{split}/mean_alpha"] = alpha_eff.mean(dim=0).cpu()
+            for expert_idx in range(alpha_eff.shape[1]):
+                yhat_idx = basis_indices[expert_idx] if basis_indices is not None else expert_idx
+                expert_pred = Yhat[:, yhat_idx][split_idx].argmax(dim=1)
                 expert_acc = (expert_pred == y_class[split_idx]).float().mean()
                 res[f"{split}/acc/expert{expert_idx}"] = expert_acc.item()
 
@@ -616,15 +672,15 @@ class ExpertsDeepSet(nn.Module):
             meanagg_acc = (meanagg_preds == y_class[split_idx]).float().mean().item()
             res[f"{split}/acc/meanagg"] = meanagg_acc
 
-            # ----- Alpha entropy diagnostics -----
+            # ----- Alpha entropy diagnostics (over effective alpha) -----
             eps = 1e-12
-            alpha_safe = alpha_eval.clamp(min=eps)
+            alpha_safe = alpha_eff.clamp(min=eps)
 
             # Per-node entropy: (N_split,)
             node_entropy = -(alpha_safe * alpha_safe.log()).sum(dim=1)
 
             # Normalize by log(t) so values are in [0, 1]
-            max_entropy = np.log(alpha_eval.shape[1])
+            max_entropy = np.log(alpha_eff.shape[1])
             node_entropy_norm = node_entropy / max_entropy
 
             # Aggregate stats
@@ -632,7 +688,7 @@ class ExpertsDeepSet(nn.Module):
             res[f"{split}/alpha_entropy_std"] = node_entropy_norm.std().item()
 
             # Entropy of mean alpha (global preference)
-            mean_alpha = alpha_eval.mean(dim=0)
+            mean_alpha = alpha_eff.mean(dim=0)
             mean_alpha_safe = mean_alpha.clamp(min=eps)
             mean_alpha_entropy = -(mean_alpha_safe * mean_alpha_safe.log()).sum()
             mean_alpha_entropy_norm = mean_alpha_entropy / max_entropy
@@ -770,6 +826,11 @@ class GOBLIN:
             None  # e.g. (|"gaussian", 2), ("fixed", "L1"), etc
         )
 
+        # Weight selection state (set by train_deepset, consumed by eval_deepset)
+        self._ws_basis_indices: list[int] | None = None
+        self._ws_k_mask: int | None = None
+        self._ws_score_feat: torch.Tensor | None = None
+
 
     def make_operator_families(
         self, cfg: OperatorSearchConfig
@@ -784,10 +845,12 @@ class GOBLIN:
                 mu, standardized
             ),
         )
+        TAU_MAX = 10.0
+        tausqrt_max = min(cfg.tausqrt_max, TAU_MAX ** 0.5)
         fams["heat"] = OperatorFamily(
             name="heat",
             param_name="tausqrt",
-            grid=np.linspace(cfg.tausqrt_min, cfg.tausqrt_max, cfg.tausqrt_num),
+            grid=np.linspace(cfg.tausqrt_min, tausqrt_max, cfg.tausqrt_num),
             eval_fn=lambda tausqrt, standardized: self.eval_accuracy_lin_heat(
                 tausqrt**2, standardized
             ),
@@ -1018,6 +1081,106 @@ class GOBLIN:
                 rows.append([trimmed, lower])
         return torch.tensor(rows, dtype=torch.float32)  # (t, 1 or 2)
 
+    def get_score_feat_for_ops(self, ops: list[OpId]) -> torch.Tensor | None:
+        """Like get_score_feat_tensor but for an arbitrary ops list."""
+        sf = self.deepset_cfg.score_feature
+        if sf == "none":
+            return None
+        rows = []
+        for op in ops:
+            yhat = self._get_op_yhat_bo(op)
+            trimmed = self.eval_accuracy(yhat, bo_objective="trimmed_20", standardized=True)
+            if sf == "trimmed":
+                rows.append([trimmed])
+            else:  # "trimmed_and_lower_half"
+                lower = self.eval_accuracy(yhat, bo_objective="lower_half", standardized=True)
+                rows.append([trimmed, lower])
+        return torch.tensor(rows, dtype=torch.float32)
+
+    def _cosine_dedup(self, ops: list[OpId], threshold: float = 0.99) -> list[OpId]:
+        """Remove near-duplicate operators by cosine similarity of train_eval predictions."""
+        eval_idxs = self.splits["train_eval"]
+        kept: list[OpId] = []
+        kept_vecs: list[torch.Tensor] = []
+        for op in ops:
+            yhat = self._get_op_yhat_bo(op)
+            flat = yhat[eval_idxs].reshape(-1).float()
+            norm = flat.norm()
+            vec = flat / norm if norm > 1e-12 else flat
+            if not any(float((vec * kv).sum()) > threshold for kv in kept_vecs):
+                kept.append(op)
+                kept_vecs.append(vec)
+        return kept
+
+    def get_feature_ops(self) -> list[OpId]:
+        """Return the feature set ops per weight_selection and feature_set_size config."""
+        ws = self.deepset_cfg.weight_selection
+        fss = self.deepset_cfg.feature_set_size
+        if ws == "current" or fss == "basis_size":
+            return list(self.basis)
+        dedup_ops = self._cosine_dedup(list(self.multi_search.sampled_ops))
+        if fss == "all":
+            result = dedup_ops
+        elif fss == "top_half":
+            fixed = [op for op in dedup_ops if op.family == "fixed"]
+            non_fixed = sorted(
+                [op for op in dedup_ops if op.family != "fixed"],
+                key=lambda op: self.multi_search.sampled_scores[op],
+                reverse=True,
+            )
+            k = max(len(non_fixed) // 2, self.multi_search.cfg.basis_size)
+            result = fixed + non_fixed[:k]
+        else:
+            raise ValueError(f"Unknown feature_set_size: {fss}")
+        # Guarantee all basis ops are present — _cosine_dedup may drop them if they
+        # are very similar to another sampled op that was kept first.
+        basis_set = set(self.basis)
+        missing = [op for op in self.basis if op not in set(result)]
+        return missing + result
+
+    def get_Yhat_for_ops(self, ops: list[OpId], splits: list[str]) -> torch.Tensor:
+        """Like get_Yhat_experts but for an arbitrary ops list. Does not set self.Yhat."""
+        Yhat = []
+        for op in ops:
+            if op.family == "gaussian":
+                mu, key = op.param, (tuple(splits), op.param)
+                if key in self._lin_gaussian_cache:
+                    Yhat.append(self._lin_gaussian_cache[key])
+                    continue
+                F = apply_lin_gaussian_operator(
+                    X=self.X,
+                    mu=mu,
+                    sigma=self.sigma,
+                    cache_dir=(self.cache_dir / f"apspd/lingauss/{self.dataset_name}"),
+                )
+            elif op.family == "heat":
+                tausqrt = op.param
+                tau = tausqrt**2
+                key = (tuple(splits), tau)
+                if key in self._lin_heat_cache:
+                    Yhat.append(self._lin_heat_cache[key])
+                    continue
+                F = apply_lin_heat_operator(
+                    tau=tau,
+                    L_sym=self.L_sym,
+                    X=self.X,
+                    eigvals=self.L_sym_eigvals,
+                    eigvecs=self.L_sym_eigvecs,
+                )
+            elif op.family == "fixed":
+                F = get_fixed_operator(self.data, self.X, operator_name=op.param)
+            else:
+                raise ValueError(f"Unknown family: {op.family}")
+
+            Yhat_expert = self.solve_linear_gnn(F=F, splits=splits)
+            if op.family == "gaussian":
+                self._lin_gaussian_cache[key] = Yhat_expert
+            elif op.family == "heat":
+                self._lin_heat_cache[key] = Yhat_expert
+            Yhat.append(Yhat_expert)
+
+        return torch.stack(Yhat, dim=1)  # (N, M, C)
+
     # ---- Build LinearGNN experts ----
     def get_Yhat_experts(self, splits: list[str]) -> torch.Tensor:
         """Get linear GNNs Yhat fit to training labels for each basis"""
@@ -1154,13 +1317,30 @@ class GOBLIN:
         return self.deepset
 
     def train_deepset(self, verbose: bool = True) -> Dict[str, float]:
-        self.get_Yhat_experts(splits=["train_fit"])
+        ws = self.deepset_cfg.weight_selection
+
         if self.deepset is None:
-            self.init_deepset()
-        assert self.deepset is not None and self.Yhat is not None
+            self.init_deepset()  # feat_dim = 4 + n_score_dims regardless of feature set size
 
         train_idx = torch.cat([self.splits[split] for split in ["train_eval"]])
-        score_feat = self.get_score_feat_tensor()
+
+        if ws == "current":
+            self.get_Yhat_experts(splits=["train_fit"])
+            score_feat = self.get_score_feat_tensor()
+            basis_indices, k_mask = None, None
+            feature_ops = None
+        else:
+            feature_ops = self.get_feature_ops()
+            self.Yhat = self.get_Yhat_for_ops(feature_ops, splits=["train_fit"])
+            score_feat = self.get_score_feat_for_ops(feature_ops)
+            if ws == "pre_filter":
+                basis_indices = [feature_ops.index(op) for op in self.basis]
+                k_mask = None
+            else:  # mask_by_deepset
+                basis_indices = None
+                k_mask = len(self.basis)
+
+        assert self.deepset is not None and self.Yhat is not None
 
         # Train on *train_eval* labels, with feats derived from Yhat fit to *train_fit* split
         loss_curve = self.deepset.train_model(
@@ -1169,16 +1349,29 @@ class GOBLIN:
             train_idx=train_idx,
             score_feat=score_feat,
             verbose=verbose,
+            basis_indices=basis_indices,
+            k_mask=k_mask,
         )
         self._last_loss_curve = loss_curve
 
         # Refit on full train set before eval
-        self.get_Yhat_experts(splits=["train_fit", "train_eval"])
+        if ws == "current":
+            self.get_Yhat_experts(splits=["train_fit", "train_eval"])
+        else:
+            self.Yhat = self.get_Yhat_for_ops(feature_ops, splits=["train_fit", "train_eval"])
+
+        # Store weight selection state for eval_deepset
+        self._ws_basis_indices = basis_indices
+        self._ws_k_mask = k_mask
+        self._ws_score_feat = score_feat
+
         metrics = self.deepset.evaluate(
             Yhat=self.Yhat,
             y_class=self.y_class,
             splits={"val": self.splits["val"], "train": train_idx},
             score_feat=score_feat,
+            basis_indices=basis_indices,
+            k_mask=k_mask,
         )
         return metrics
 
@@ -1371,12 +1564,16 @@ class GOBLIN:
         )
 
     def eval_deepset(self, splits: list[str]) -> Dict[str, float]:
-        self.get_Yhat_experts(splits=["train_fit", "train_eval"])
         if self.deepset is None:
             raise ValueError(
                 "DeepSet not initialised. Call init_deepset() or train_deepset() or load_deepset()."
             )
-        score_feat = self.get_score_feat_tensor()
+        # Use weight selection state set by train_deepset; fall back to basis score feat
+        score_feat = (
+            self._ws_score_feat
+            if self._ws_score_feat is not None
+            else self.get_score_feat_tensor()
+        )
         eval_splits = {split: self.splits[split] for split in splits}
         eval_splits["+".join(splits)] = torch.cat(
             [self.splits[split] for split in splits]
@@ -1386,6 +1583,8 @@ class GOBLIN:
             y_class=self.y_class,
             splits=eval_splits,
             score_feat=score_feat,
+            basis_indices=self._ws_basis_indices,
+            k_mask=self._ws_k_mask,
         )
 
     def save_deepset(self, path: Path):

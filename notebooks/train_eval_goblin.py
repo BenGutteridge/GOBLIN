@@ -30,8 +30,8 @@ hparams = {
     "train_ds": "Cora",
     "seed": 0,
     "bo_objective": "trimmed_20",
-    "basis_size": 2,
-    "basis_selection_rule": "diverse_top_k",
+    "basis_size": 5,
+    "basis_selection_rule": "greedy_diversity",  # "top_k" | "greedy_diversity"
     "enforce_family_coverage": False,
     "n_samples": 15,    # total linear GNN solves including anchors
     "ucb_beta": 1.0,    # β in acq = -µ_GP + β·σ_GP; 0 = pure exploitation
@@ -44,7 +44,7 @@ hparams = {
     "tausqrt_min": 0.0,
     "tausqrt_max": 5.0,
     "tausqrt_num": 50,
-    "diversity_lambda": 0.0,  # λ for greedy_diversity rule (0 = pure top-k)
+    "diversity_lambda": 0.2,  # λ for greedy_diversity rule (0 = pure top-k)
     "mu_anchor": 1.0,         # gaussian family initial GP sample (None = disable)
     "tausqrt_anchor": 1.5,    # heat family initial GP sample (None = disable)
     "num_fixed_operators": 1,
@@ -64,10 +64,12 @@ hparams = {
     "num_head_layers": 1,
     "epochs": 500,
     "score_feature": "none",  # "none" | "trimmed" | "trimmed_and_lower_half"
+    "weight_selection": "current",   # "current" | "pre_filter" | "mask_by_deepset"
+    "feature_set_size": "all",       # "all" | "top_half" | "basis_size"
     # stochastic training (set to False to use fixed full-batch training)
-    "stochastic_training": True,
+    "stochastic_training": False,
     "n_batches": 1000,
-    "batch_size": 128,
+    "batch_size": 40, # for Cora with very few labels
     "n_ref_per_class": 5,
 }
 
@@ -218,6 +220,8 @@ deepset_cfg = ExpertsDeepSetConfig(
     lr=p["lr"],
     dropout=p["dropout"],
     score_feature=p["score_feature"],
+    weight_selection=p["weight_selection"],
+    feature_set_size=p["feature_set_size"],
     n_batches=p["n_batches"],
     batch_size=p["batch_size"],
     n_ref_per_class=p["n_ref_per_class"],
