@@ -669,7 +669,8 @@ class ExpertsDeepSet(nn.Module):
         opt = torch.optim.Adam(self.parameters(), lr=self.cfg.lr)
         loss_curve: list[float] = []
 
-        for epoch in range(self.cfg.epochs):
+        pbar = tqdm(range(self.cfg.epochs), desc="Training DeepSet", unit="epoch")
+        for epoch in pbar:
             self.train()
             alpha = self(H[train_idx])
             Yhat_bar, _ = self._apply_weight_selection(alpha, Yhat[train_idx], basis_indices, k_mask)
@@ -684,6 +685,7 @@ class ExpertsDeepSet(nn.Module):
             opt.step()
 
             loss_curve.append(loss.item())
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
             if verbose and (epoch % self.cfg.log_every == 0):
                 print(f"Epoch {epoch}, loss={loss.item():.4f}")
 
@@ -1335,7 +1337,7 @@ class GOBLIN:
         # Gaussian half
         n_gauss = cfg.pool_size // 2
         mus = rng.uniform(cfg_s.mu_min, cfg_s.mu_max, n_gauss)
-        for mu in mus:
+        for mu in tqdm(mus, desc="Pool: Gaussian ops", unit="op", leave=False):
             F = apply_lin_gaussian_operator(
                 X=self.X, mu=float(mu), sigma=self.sigma,
                 cache_dir=self.cache_dir / f"apspd/lingauss/{self.dataset_name}",
@@ -1346,7 +1348,7 @@ class GOBLIN:
         # Heat half
         n_heat = cfg.pool_size - n_gauss
         tausqrts = rng.uniform(cfg_s.tausqrt_min, cfg_s.tausqrt_max, n_heat)
-        for tausqrt in tausqrts:
+        for tausqrt in tqdm(tausqrts, desc="Pool: Heat ops", unit="op", leave=False):
             F = apply_lin_heat_operator(
                 tau=float(tausqrt) ** 2, L_sym=self.L_sym,
                 X=self.X.to(self.L_sym.device),
@@ -1452,7 +1454,8 @@ class GOBLIN:
         gen.manual_seed(self.seed)
         loss_curve: list[float] = []
 
-        for batch_idx in range(cfg.n_batches):
+        pbar = tqdm(range(cfg.n_batches), desc="Training DeepSet (stochastic)", unit="batch")
+        for batch_idx in pbar:
             self.deepset.train()
 
             # Partition: first batch_size → Vtarget, rest → Vref pool
@@ -1492,6 +1495,7 @@ class GOBLIN:
             opt.step()
 
             loss_curve.append(loss.item())
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
             if verbose and batch_idx % cfg.log_every == 0:
                 print(f"Batch {batch_idx}, loss={loss.item():.4f}")
 
@@ -1540,7 +1544,8 @@ class GOBLIN:
         need_score = cfg.score_feature != "none"
         n_score_dims = 2 if cfg.score_feature == "trimmed_and_lower_half" else 1
 
-        for batch_idx in range(cfg.n_batches):
+        pbar = tqdm(range(cfg.n_batches), desc="Training DeepSet (pool)", unit="batch")
+        for batch_idx in pbar:
             self.deepset.train()
 
             # Sample n_ops_per_batch from pool (without replacement)
@@ -1599,6 +1604,7 @@ class GOBLIN:
             opt.step()
 
             loss_curve.append(loss.item())
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
             if verbose and batch_idx % cfg.log_every == 0:
                 print(f"Batch {batch_idx}, loss={loss.item():.4f}")
 

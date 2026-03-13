@@ -88,7 +88,7 @@ def build_and_cache_city_distance_operators(
         print(f"Distance operator for dist=0 already cached. Skipping.")
 
     # M_dist_k for k = 1..max_k
-    for k in range(1, max_k + 1):
+    for k in tqdm(range(1, max_k + 1), desc="Building M_dist_k", unit="k"):
         path = os.path.join(cache_dir, f"M_dist_{k}.pt")
         if os.path.exists(path):
             print(f"Distance operator for dist={k} already cached. Skipping.")
@@ -97,6 +97,7 @@ def build_and_cache_city_distance_operators(
         if not khop_file.exists():
             print(f"Warning: {khop_file} not found. Skipping dist={k}.")
             continue
+        print(f"Loading khop file for dist={k}: {khop_file}")
         with gzip.open(str(khop_file), "rb") as f:
             d = torch.load(f, weights_only=True)
         N = d["N"]
@@ -193,9 +194,13 @@ def compute_mean_spd(
     if cache_dir is None:
         raise ValueError("cache_dir must be provided when all_pairs_dist is None")
     cache_dir = Path(cache_dir)
+    mean_spd_cache = cache_dir / "mean_spd.txt"
+    if mean_spd_cache.exists():
+        return float(mean_spd_cache.read_text().strip())
     total_dist = 0.0
     total_count = 0
-    for k in range(1, max_k + 1):
+    print(f"compute_mean_spd: loading M_dist_k files from {cache_dir}")
+    for k in tqdm(range(1, max_k + 1), desc="compute_mean_spd", unit="k"):
         path = cache_dir / f"M_dist_{k}.pt"
         if not path.exists():
             break
@@ -205,7 +210,9 @@ def compute_mean_spd(
         total_count += count
     if total_count == 0:
         return 1.0
-    return total_dist / total_count
+    mean_spd = total_dist / total_count
+    mean_spd_cache.write_text(str(mean_spd))
+    return mean_spd
 
 
 def recommended_max_dist(mean_spd: float) -> int:
@@ -364,10 +371,8 @@ def apply_lin_gaussian_operator(
 
     # Precompute Gaussian weights (cheap)
     # We only load matrices that exist on disk
-    for fname in sorted(os.listdir(cache_dir)):
-        if not fname.startswith("M_dist_"):
-            continue
-
+    m_dist_files = sorted(f for f in os.listdir(cache_dir) if f.startswith("M_dist_"))
+    for fname in tqdm(m_dist_files, desc=f"LinGauss(mu={mu:.2f})", unit="M_k", leave=False):
         dist = int(fname.split("_")[-1].split(".")[0])
         w = np.exp(-((mu - dist) ** 2) / (2 * sigma**2))
 
@@ -430,7 +435,7 @@ def apply_lin_heat_operator(
     F = X.clone()
     term = X.clone()  # (-tau L)^k X
 
-    for k in range(1, taylor_k + 1):
+    for k in tqdm(range(1, taylor_k + 1), desc="LinHeat Taylor expansion", unit="term", leave=False):
         term = (-tau / k) * (L_sym @ term)
         F = F + term
     return F.cpu()
