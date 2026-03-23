@@ -72,7 +72,7 @@ python notebooks/get_range_figures.py
 
 **Notes:** All-pairs shortest-path and operator caches are computed on first use and cached automatically. GraphAny's operator cache can be disk-intensive on first run.
 
-**TS-GNN:** `tsgnn/` contains the minimal [EquivarianceEverywhere](https://github.com/Saro00/EquivarianceEverywhere) code needed to reproduce results. It uses Triton kernels and requires a CUDA GPU. Set `TSGNN_DATA_DIR` to a directory for dataset/LS caches, and optionally `TSGNN_MODELS_DIR` to reuse pre-trained checkpoints.
+**TS-GNN:** `tsgnn/` contains the minimal [EquivarianceEverywhere](https://github.com/Saro00/EquivarianceEverywhere) code needed to reproduce results. It uses Triton kernels and requires a CUDA GPU. Datasets and LS caches default to `data/tsgnn/`; set `TSGNN_DATA_DIR` to override. Set `TSGNN_MODELS_DIR` to reuse pre-trained checkpoints.
 
 ---
 

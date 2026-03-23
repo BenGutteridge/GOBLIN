@@ -43,15 +43,11 @@ from tsgnn.utils import set_seed, coo_to_csr, accuracy, SEEDS
 from goblin.config import DATA_CACHE
 HOPSIGN_CACHE = DATA_CACHE / "goblin_khopsign"
 
-# LS cache and PyG dataset cache — defaults to the original EE repo location.
-# Override with TSGNN_DATA_DIR to point to a local copy.
-TSGNN_DATA_DIR = Path(os.environ.get("TSGNN_DATA_DIR",
-                      "/slurm-storage/bengut/ee_copy/EquivarianceEverywhere/datasets"))
+# LS cache and PyG dataset cache. Override with TSGNN_DATA_DIR env var.
+TSGNN_DATA_DIR = Path(os.environ.get("TSGNN_DATA_DIR", str(ROOT / "data" / "tsgnn")))
 
-# Saved model checkpoints — defaults to the original EE repo location.
-# Override with TSGNN_MODELS_DIR to point to a local copy.
-TSGNN_MODELS_DIR = Path(os.environ.get("TSGNN_MODELS_DIR",
-                        "/slurm-storage/bengut/ee_copy/EquivarianceEverywhere/saved_models"))
+# Saved model checkpoints. Override with TSGNN_MODELS_DIR env var.
+TSGNN_MODELS_DIR = Path(os.environ.get("TSGNN_MODELS_DIR", str(ROOT / "ckpts" / "tsgnn")))
 
 RESULTS_DIR = ROOT / "results" / "tsgnn"
 
