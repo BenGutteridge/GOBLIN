@@ -77,6 +77,9 @@ _all_datasets: [
   Questions,
 ]
 
+hopsign_datasets:
+  [ 1HopSign, 2HopSign, 3HopSign, 4HopSign, 5HopSign, 6HopSign, 7HopSign, 8HopSign ]
+
 all_and_hopsign_datasets_demo:
   [
     2HopSign,
@@ -150,9 +153,33 @@ _dataset_lookup:
     train: [ Wisconsin ]
     eval: ${all_and_hopsign_datasets}
 
+  CoraXAllAndHopSign:
+    train: [ Cora ]
+    eval: ${all_and_hopsign_datasets}
+
+  CoraX25Benchmarks:
+    train: [ Cora ]
+    eval: ${range_eval_datasets}
+
+  CoraXHopSign:
+    train: [ Cora ]
+    eval: ${hopsign_datasets}
+
+  WisconsinXHopSign:
+    train: [ Wisconsin ]
+    eval: ${hopsign_datasets}
+
   WisconsinXAllAndHopSignDemo:
     train: [ Wisconsin ]
     eval: ${all_and_hopsign_datasets_demo}
+
+  WisconsinXAllCityNetworks:
+    train: [ Wisconsin ]
+    eval: [ CityParis, CityShanghai, CityLA, CityLondon ]
+
+  CoraXAllCityNetworks:
+    train: [ Cora ]
+    eval: [ CityParis, CityShanghai, CityLA, CityLondon ]
 
 
   # All train-eval pairs; likely inefficient but it works for now
@@ -604,8 +631,14 @@ _ds_meta_data:
   1HopSign: k_hop_sign, SyntheticDataset.1HopSign
   2HopSign: k_hop_sign, SyntheticDataset.2HopSign
   3HopSign: k_hop_sign, SyntheticDataset.3HopSign
-  4HopSign: k_hop_sign, SyntheticDataset.4HopSign 
+  4HopSign: k_hop_sign, SyntheticDataset.4HopSign
   5HopSign: k_hop_sign, SyntheticDataset.5HopSign
   6HopSign: k_hop_sign, SyntheticDataset.6HopSign
   7HopSign: k_hop_sign, SyntheticDataset.7HopSign
   8HopSign: k_hop_sign, SyntheticDataset.8HopSign
+
+  # CityNetwork (long-range task) datasets
+  CityParis: city_network, CityParis
+  CityShanghai: city_network, CityShanghai
+  CityLA: city_network, CityLA
+  CityLondon: city_network, CityLondon

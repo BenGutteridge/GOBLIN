@@ -278,6 +278,11 @@ class GraphDataset(pl.LightningDataModule):
                 "k": k,
                 "_target_": target,
             }
+        elif self.data_source == "city_network":
+            ds_init_args = {
+                "name": self.name,
+                "_target_": "goblin.data.build_city_network_dataset_wrapper",
+            }
         else:
             raise NotImplementedError(f"Unsupported {self.data_source=}")
         self.data_init_args = OmegaConf.create(ds_init_args)
@@ -318,9 +323,28 @@ class GraphDataset(pl.LightningDataModule):
         self.randomized_node_indices = torch.randperm(
             N
         )  # for sampling for APSPD for large graphs and for range stats
-        self.get_all_pairs_shortest_path_distances()
-        apspd = self.all_pairs_shortest_path_distances["spd"].reshape(N, -1)
-        apspd_idxs = self.all_pairs_shortest_path_distances.get("node_idxs", None)
+
+        # APSPD is only needed for N*, D* channels and compute_range.
+        # Skip it entirely for standard X/L/H channels to avoid expensive BFS.
+        # Also skip if all APSPD-dependent channels are already cached.
+        uncached_channels = [
+            chn for chn in sorted_channels
+            if not (
+                self.cache_dir
+                / f"{self.name}_{chn}_selfloop={cfg.add_self_loop}_bidirected={cfg.to_bidirected}_split={self.split_index}.pt"
+            ).exists()
+        ]
+        _needs_apspd = cfg.get("compute_range", False) or any(
+            c[0] in ("N", "D") for c in uncached_channels
+        )
+        if _needs_apspd:
+            self.get_all_pairs_shortest_path_distances()
+            apspd = self.all_pairs_shortest_path_distances["spd"].reshape(N, -1)
+            apspd_idxs = self.all_pairs_shortest_path_distances.get("node_idxs", None)
+        else:
+            self.all_pairs_shortest_path_distances = None
+            apspd = None
+            apspd_idxs = None
 
         # # COMPUTE LINEAR GNN FEATS
         X = self.feat  # [N, d]
@@ -345,9 +369,12 @@ class GraphDataset(pl.LightningDataModule):
 
             # Otherwise, compute
             S = None
-            dist_median = int(apspd.median().item())
-            dist_mean = apspd.float().mean().item()
-            diameter = int(apspd.max().item())
+            if apspd is not None:
+                dist_median = int(apspd.median().item())
+                dist_mean = apspd.float().mean().item()
+                diameter = int(apspd.max().item())
+            else:
+                dist_median = dist_mean = diameter = None
             if chn == "X":
                 lp, hops = True, 0
             elif chn[0] == "L":
@@ -716,6 +743,16 @@ class GraphDataset(pl.LightningDataModule):
 
                 self.split_index = self.cfg.seed
         elif self.data_source == "k_hop_sign":
+            (
+                g,
+                label,
+                num_class,
+                feat,
+                train_mask,
+                val_mask,
+                test_mask,
+            ) = dataset
+        elif self.data_source == "city_network":
             (
                 g,
                 label,
@@ -1130,10 +1167,50 @@ class GraphDataset(pl.LightningDataModule):
             f"Computing all pairs shortest path distances for {self.name} graph with {self.g.num_nodes()} nodes."
         )
 
-        full_apspd_filepath = self.cache_dir.parent / "apspd" / f"{self.name}_apspd.pt"
+        apspd_dir = self.cache_dir.parent / "apspd"
+        apspd_dir.mkdir(parents=True, exist_ok=True)
+        full_apspd_filepath = apspd_dir / f"{self.name}_apspd.pt"
         if os.path.exists(full_apspd_filepath):
             logger.info(f"Loading cached full APSPD from {full_apspd_filepath}")
             self.all_pairs_shortest_path_distances = torch.load(full_apspd_filepath)
+            return
+
+        # Try reconstructing from GOBLIN's per-shell sparse cache (avoids expensive BFS)
+        goblin_cache_dir = self.cache_dir / "apspd" / "lingauss" / self.name
+        if goblin_cache_dir.exists():
+            logger.info(
+                f"Constructing APSPD from GOBLIN per-shell cache at {goblin_cache_dir}"
+            )
+            spd_dense = torch.full((N, N), -1, dtype=torch.int8)
+            spd_dense[range(N), range(N)] = 0  # self-distance = 0
+            max_k = 0
+            for k in range(1, 100):
+                fpath = goblin_cache_dir / f"M_dist_{k}.pt"
+                if not fpath.exists():
+                    break
+                M_k = torch.load(fpath, map_location="cpu").coalesce()
+                r, c = M_k.indices()
+                spd_dense[r, c] = k
+                max_k = k
+                del M_k
+
+            mean_spd_file = goblin_cache_dir / "mean_spd.txt"
+            if mean_spd_file.exists():
+                avg_spd = float(mean_spd_file.read_text().strip())
+            else:
+                valid = spd_dense[spd_dense >= 0].float()
+                avg_spd = valid.mean().item()
+
+            self.all_pairs_shortest_path_distances = {
+                "spd": spd_dense,
+                "average_deg": self.g.num_edges() / N,
+                "diameter": max_k,
+                "avg_spd": avg_spd,
+            }
+            torch.save(
+                self.all_pairs_shortest_path_distances, full_apspd_filepath
+            )
+            logger.info(f"Saved reconstructed APSPD to {full_apspd_filepath}")
             return
 
         if cfg.max_khops is not None:
@@ -1161,8 +1238,7 @@ class GraphDataset(pl.LightningDataModule):
         for l in range(0, min(N_s, N), N_s_i):
             r = min(l + N_s_i, N)
             sampled_apspd_filepath = (
-                self.cache_dir.parent
-                / "apspd"
+                apspd_dir
                 / f"{self.name}_apspd_sampled_{l:04d}-{r:04d}_seed{cfg.sampling_seed:02d}.pt"
             )
             if os.path.exists(sampled_apspd_filepath):

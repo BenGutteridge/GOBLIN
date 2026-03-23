@@ -17,6 +17,7 @@ class GraphAny(nn.Module):
         att_temperature,
         entropy=1,
         n_mlp_layer=2,
+        **kwargs,
     ):
         super(GraphAny, self).__init__()
         self.feat_channels = feat_channels  # channels used as features p_u(i|j)

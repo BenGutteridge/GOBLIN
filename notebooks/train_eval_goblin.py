@@ -1,3 +1,5 @@
+import argparse
+import dataclasses
 import numpy as np
 import hashlib
 import json
@@ -12,57 +14,83 @@ if ROOT.name == "notebooks":
 sys.path.insert(0, str(ROOT))
 
 from goblin import GOBLIN, OperatorSearchConfig, ExpertsDeepSetConfig, MultiSearchConfig
+from goblin.config import DATA_CACHE
 from goblin.data import (
     load_graph_dataset,
     build_hopsign_dataset,
     build_and_cache_distance_operators,
+    build_and_cache_city_distance_operators,
+    compute_mean_spd,
+    recommended_max_dist,
 )
 
+hopsign_cache_dir = DATA_CACHE / "goblin_khopsign"
+lingauss_cache_dir = DATA_CACHE / "apspd/lingauss"
 
 hparams = {
     "train_ds": "Cora",
     "seed": 0,
     "bo_objective": "trimmed_20",
-    "basis_size": 2,
-    "mix_strategy": "balanced",
-    "bias_prob": 0.50,
-    "basis_selection_rule": "diverse_top_k",
+    "basis_size": 3,
+    "basis_selection_rule": "greedy_diversity",  # "top_k" | "greedy_diversity"
     "enforce_family_coverage": False,
-    "num_explore_steps": 9,
-    "num_exploit_steps": 6,
+    "n_samples": 25,    # total linear GNN solves including anchors
+    "ucb_beta": 3.0,    # β in acq = -µ_GP + β·σ_GP; 0 = pure exploitation
     # LinGauss
     "mu_min": 0.0,
     "mu_max": 8.0,
     "mu_num": 250,
     "sigma": 0.5,
-    "search_min_sep_mu": 0.2,
-    "basis_min_sep_mu": 0.5,
-    # LinHeat
-    "tau_min": 0.0,
-    "tau_max": 5.0,
-    "tau_num": 50,
-    "search_min_sep_tau": 0.1,
-    "basis_min_sep_tau": 1.0,
+    # LinHeat (search is over tausqrt = sqrt(tau))
+    "tausqrt_min": 0.0,
+    "tausqrt_max": 5.0,
+    "tausqrt_num": 50,
+    "diversity_lambda": 0.2,  # λ for greedy_diversity rule (0 = pure top-k)
+    "mu_anchors": 5,           # gaussian family anchors: int (N auto-spaced), float, list[float], or None
+    "tausqrt_anchors": 2,     # heat family anchors: int (N auto-spaced), float, list[float], or None
     "num_fixed_operators": 1,
-    "fixed_operators": ["L1"],
+    # Adaptive search bounds (0 = use fixed bounds; >0 = scale by mean SPD)
+    "spd_scale_factor_mu": 1.25,   # mu_max      = spd_scale_factor_mu  * mean_SPD (or mu_max      if 0)
+    "spd_scale_factor_tau": 1.25,  # tausqrt_max = spd_scale_factor_tau * mean_SPD (or tausqrt_max if 0)
     # GP
     "rbf_length_scale": 1.0,
     "white_noise": 0.2,
     # DeepSet
     "lr": 3e-4,
-    "dropout": 0.0,
-    "hidden_dim": 32,
-    "attn_temp": 10.0,
-    "num_deepset_layers": 2,
+    "dropout": 0.1,
+    "hidden_dim": 64,
+    "attn_temp": 2.0,
+    "num_deepset_layers": 3,
     "num_head_layers": 1,
-    "epochs": 500,
+    "epochs": 1000,
+    "score_feature": "none",  # "none" | "trimmed" | "trimmed_and_lower_half"
+    "weight_selection": "pre_filter",  # "current" | "pre_filter" | "mask_by_deepset"
+    "feature_set_size": "all",         # "all" | "top_half" | "basis_size"
+    # Training mode: "pool" (canonical), "stochastic", or "batch"
+    "training_mode": "pool",
+    "pool_size": 50,
+    "n_ops_per_batch": 5,
+    "n_batches": 500,
+    "batch_size": 40,
+    "n_ref_per_class": 5,
 }
 
-# Uncomment as required
+# Uncomment as required, or pass --eval_dataset via CLI
+
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--eval_dataset", type=str, default=None)
+for _key, _val in hparams.items():
+    if isinstance(_val, bool):
+        _parser.add_argument(f"--{_key}", type=lambda x: x.lower() in ('true', '1', 'yes'), default=None)
+    elif isinstance(_val, list):
+        _parser.add_argument(f"--{_key}", nargs='+', default=None)
+    else:
+        _parser.add_argument(f"--{_key}", type=type(_val), default=None)
+_args, _ = _parser.parse_known_args()
 
 eval_ds = [
     # # HopSign
-    "1HopSign",
+    # "1HopSign",
     # "2HopSign",
     # "3HopSign",
     # "4HopSign",
@@ -97,16 +125,36 @@ eval_ds = [
     # "AmzRatings",
     # "CoPhysics",
     # "Questions",
+    #
+    # CityNetworks
+    # "CityParis",
+    # "CityShanghai",
+    # "CityLA",
+    # "CityLondon",
 ]
 
-p = hparams
+if _args.eval_dataset is not None:
+    eval_ds = [_args.eval_dataset]
+
+p = dict(hparams)
+for _key in hparams:
+    _val = getattr(_args, _key)
+    if _val is not None:
+        p[_key] = _val
 hparam_str = json.dumps(p, sort_keys=True)
 hparam_hash = hashlib.md5(hparam_str.encode()).hexdigest()
 
 model_ckpt_path = Path(f"ckpts/goblin/{hparam_hash}.pt")
-results_path = Path(f"output/results/goblin/{hparam_hash}.pt")
+# Use per-dataset results path when eval_dataset is specified, to avoid race
+# conditions when multiple parallel jobs share the same hparam_hash.
+if _args.eval_dataset is not None:
+    results_path = Path(f"results/goblin/{hparam_hash}/{_args.eval_dataset}.pt")
+else:
+    results_path = Path(f"results/goblin/{hparam_hash}.pt")
 results_path.parent.mkdir(parents=True, exist_ok=True)
 model_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
+CITY_DATASETS = {"CityParis", "CityShanghai", "CityLA", "CityLondon"}
 
 print("Hparam hash:", hparam_hash)
 print("Sampled hyperparameters:", p)
@@ -117,40 +165,54 @@ data, X, all_pairs_dist, y_class, y_onehot, splits, C = load_graph_dataset(
     name=p["train_ds"],
     root=Path("data/goblin"),
     seed=p["seed"],
-    compute_all_pairs_dist=True,
+    compute_all_pairs_dist=(p["train_ds"] not in CITY_DATASETS),
 )
 
-build_and_cache_distance_operators(
+if p["train_ds"] in CITY_DATASETS:
+    build_and_cache_city_distance_operators(
+        city_name=p["train_ds"],
+        cache_dir=lingauss_cache_dir / p["train_ds"],
+        max_k=20,
+    )
+elif all_pairs_dist is not None:  # None means M_dist_k cache already sufficient
+    _train_mean_spd_for_cache = compute_mean_spd(all_pairs_dist)
+    build_and_cache_distance_operators(
+        all_pairs_dist,
+        max_dist=recommended_max_dist(_train_mean_spd_for_cache),  # previously set to 10
+        cache_dir=lingauss_cache_dir / p["train_ds"],
+    )
+
+_train_mean_spd = compute_mean_spd(
     all_pairs_dist,
-    max_dist=10,
-    cache_dir=f"data_cache/lingauss/{p['train_ds']}",
+    cache_dir=lingauss_cache_dir / p["train_ds"] if all_pairs_dist is None else None,
 )
+_train_mu_max = p["spd_scale_factor_mu"] * _train_mean_spd if p["spd_scale_factor_mu"] > 0 else p["mu_max"]
+_train_tausqrt_max = p["spd_scale_factor_tau"] * _train_mean_spd if p["spd_scale_factor_tau"] > 0 else p["tausqrt_max"]
+print(f"Train mean SPD: {_train_mean_spd:.3f} → mu_max={_train_mu_max:.3f}, tausqrt_max={_train_tausqrt_max:.3f}")
 
 operator_cfg = OperatorSearchConfig(
     families=["heat", "gaussian"],
     bo_objective=p["bo_objective"],
-    num_explore_steps=p["num_explore_steps"],
-    num_exploit_steps=p["num_exploit_steps"],
+    ucb_beta=p["ucb_beta"],
     mu_min=p["mu_min"],
-    mu_max=p["mu_max"],
+    mu_max=_train_mu_max,
     mu_num=p["mu_num"],
-    tau_min=p["tau_min"],
-    tau_max=p["tau_max"],
-    tau_num=p["tau_num"],
+    tausqrt_min=p["tausqrt_min"],
+    tausqrt_max=_train_tausqrt_max,
+    tausqrt_num=p["tausqrt_num"],
     rbf_length_scale=p["rbf_length_scale"],
     white_noise=p["white_noise"],
 )
 
 multi_search_cfg = MultiSearchConfig(
-    total_steps=(p["num_explore_steps"] + p["num_exploit_steps"]),
-    mix_strategy=p["mix_strategy"],
+    n_samples=p["n_samples"],
     basis_size=p["basis_size"],
-    basis_min_sep_mu=p["basis_min_sep_mu"],
-    basis_min_sep_tau=p["basis_min_sep_tau"],
-    bias_prob=p["bias_prob"],
     enforce_family_coverage=p["enforce_family_coverage"],
-    include_fixed_ops=p["fixed_operators"],
+    include_fixed_ops=["L2"] if p.get("num_fixed_operators", 0) > 0 else [],
     basis_selection_rule=p["basis_selection_rule"],
+    diversity_lambda=p["diversity_lambda"],
+    mu_anchors=p["mu_anchors"],
+    tausqrt_anchors=p["tausqrt_anchors"],
 )
 
 deepset_cfg = ExpertsDeepSetConfig(
@@ -161,6 +223,14 @@ deepset_cfg = ExpertsDeepSetConfig(
     epochs=p["epochs"],
     lr=p["lr"],
     dropout=p["dropout"],
+    score_feature=p["score_feature"],
+    weight_selection=p["weight_selection"],
+    feature_set_size=p["feature_set_size"],
+    n_batches=p["n_batches"],
+    batch_size=p["batch_size"],
+    n_ref_per_class=p["n_ref_per_class"],
+    pool_size=p["pool_size"],
+    n_ops_per_batch=p["n_ops_per_batch"],
 )
 
 goblin = GOBLIN(
@@ -187,12 +257,19 @@ basis = goblin.select_basis()
 print("Final basis:", basis)
 
 # ---- Train DeepSet ----
-metrics = goblin.train_deepset(verbose=True)
+if p["training_mode"] == "pool":
+    metrics = goblin.train_deepset_pool(verbose=True)
+elif p["training_mode"] == "stochastic":
+    metrics = goblin.train_deepset_stochastic(verbose=True)
+else:
+    metrics = goblin.train_deepset(verbose=True)
 
 goblin.save_deepset(model_ckpt_path)
 
 # ###### EVAL ########
-full_results = {"ckpt_path": str(model_ckpt_path), "hparams": p, "hash": hparam_hash}
+full_results = torch.load(results_path) if results_path.exists() else {}
+full_results.update({"ckpt_path": str(model_ckpt_path), "hparams": p, "hash": hparam_hash,
+                      "loss_curve": goblin._last_loss_curve, "train_metrics": metrics})
 
 # Evaluate on HopSign
 N = 1000
@@ -212,11 +289,14 @@ for k in tqdm(range(1, int(p["mu_max"]) + 1)):
         label_noise=label_noise,
     )
 
+    _mean_spd = compute_mean_spd(test_dataset["all_pairs_dist"])
     build_and_cache_distance_operators(
         test_dataset["all_pairs_dist"],
-        max_dist=10,
-        cache_dir=f"data_cache/lingauss/{ds_name}",
+        max_dist=recommended_max_dist(_mean_spd),  # previously set to 10
+        cache_dir=hopsign_cache_dir / ds_name,
     )
+    _mu_max = p["spd_scale_factor_mu"] * _mean_spd if p["spd_scale_factor_mu"] > 0 else p["mu_max"]
+    _tausqrt_max = p["spd_scale_factor_tau"] * _mean_spd if p["spd_scale_factor_tau"] > 0 else p["tausqrt_max"]
 
     eval_goblin = GOBLIN(
         data=test_dataset["data"],
@@ -227,7 +307,7 @@ for k in tqdm(range(1, int(p["mu_max"]) + 1)):
         splits=test_dataset["splits"],
         sigma=p["sigma"],
         C=2,
-        operator_search_cfg=operator_cfg,
+        operator_search_cfg=dataclasses.replace(operator_cfg, mu_max=_mu_max, tausqrt_max=_tausqrt_max),
         multi_search_cfg=multi_search_cfg,
         deepset_cfg=deepset_cfg,
         seed=p["seed"],
@@ -249,18 +329,34 @@ for k in tqdm(range(1, int(p["mu_max"]) + 1)):
 for ds in tqdm(eval_ds):
     if ds.endswith("HopSign"):
         continue
+
     data, X, all_pairs_dist, y_class, y_onehot, splits, C = load_graph_dataset(
         name=ds,
         root=Path("data/goblin"),
         seed=p["seed"],
-        compute_all_pairs_dist=True,
+        compute_all_pairs_dist=(ds not in CITY_DATASETS),
     )
 
-    build_and_cache_distance_operators(
+    if ds in CITY_DATASETS:
+        build_and_cache_city_distance_operators(
+            city_name=ds,
+            cache_dir=lingauss_cache_dir / ds,
+            max_k=20,
+        )
+    elif all_pairs_dist is not None:  # None means M_dist_k cache already sufficient
+        _mean_spd_for_cache = compute_mean_spd(all_pairs_dist)
+        build_and_cache_distance_operators(
+            all_pairs_dist,
+            max_dist=recommended_max_dist(_mean_spd_for_cache),  # previously set to 10
+            cache_dir=lingauss_cache_dir / ds,
+        )
+
+    _mean_spd = compute_mean_spd(
         all_pairs_dist,
-        max_dist=10,
-        cache_dir=f"data_cache/lingauss/{ds}",
+        cache_dir=lingauss_cache_dir / ds if all_pairs_dist is None else None,
     )
+    _mu_max = p["spd_scale_factor_mu"] * _mean_spd if p["spd_scale_factor_mu"] > 0 else p["mu_max"]
+    _tausqrt_max = p["spd_scale_factor_tau"] * _mean_spd if p["spd_scale_factor_tau"] > 0 else p["tausqrt_max"]
 
     eval_goblin = GOBLIN(
         data=data,
@@ -271,7 +367,7 @@ for ds in tqdm(eval_ds):
         splits=splits,
         sigma=p["sigma"],
         C=C,
-        operator_search_cfg=operator_cfg,
+        operator_search_cfg=dataclasses.replace(operator_cfg, mu_max=_mu_max, tausqrt_max=_tausqrt_max),
         multi_search_cfg=multi_search_cfg,
         deepset_cfg=deepset_cfg,
         seed=p["seed"],

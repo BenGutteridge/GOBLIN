@@ -2,10 +2,13 @@
 .venv
 .vscode
 __pycache__
-data_cache/goblin_khopsign/
-data_cache/lingauss/
+data_cache/
 data/
 ckpts/
 output/
 temp/
-data_cache/
+.claude/
+scratch/
+slurm_logs/
+figures/
+archive/
