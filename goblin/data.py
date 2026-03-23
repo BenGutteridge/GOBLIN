@@ -888,29 +888,10 @@ def load_graph_dataset(
     # -----------------------------
     if compute_all_pairs_dist:
         N = X.shape[0]
-        lingauss_cache = cache_dir / f"apspd/lingauss/{name}"
-        # If M_dist_k cache already exists and is deep enough, skip loading the
-        # full (potentially multi-GB) APSPD tensor — apply_lin_gaussian_operator
-        # reads M_dist_k files directly and never needs the raw APSPD tensor.
-        all_pairs_dist = None
-        sentinel = lingauss_cache / ".built_max_dist"
-        if sentinel.exists():
-            mean_spd_est = compute_mean_spd(None, cache_dir=lingauss_cache)
-            required_max = recommended_max_dist(mean_spd_est)
-            built_max = int(sentinel.read_text().strip())
-            if built_max >= required_max:
-                print(f"M_dist_k cache sufficient (built_max={built_max} ≥ {required_max}) for {name} — skipping full APSPD load.")
-            else:
-                # Cache exists but was built with a smaller max_dist — extend it
-                print(f"M_dist_k cache built_max={built_max} < {required_max} for {name} — loading APSPD to extend.")
-                all_pairs_dist = _load_or_compute_apspd(name, data, N, cache_dir)
-        elif (lingauss_cache / "M_dist_1.pt").exists():
-            # Legacy cache without sentinel — conservative: load APSPD to rebuild
-            print(f"M_dist_k cache has no sentinel for {name} — loading APSPD to rebuild with dynamic max_dist.")
-            all_pairs_dist = _load_or_compute_apspd(name, data, N, cache_dir)
-        else:
-            # No cache at all — first run, must load APSPD to build it
-            all_pairs_dist = _load_or_compute_apspd(name, data, N, cache_dir)
+        # Always load the APSPD tensor into memory — eval_accuracy_lin_gaussian uses
+        # apply_lin_gaussian_operator_slow (in-memory) which is far faster than
+        # loading per-shell M_dist_k.pt files from NFS (M_dist_4 for Questions = 23 GB).
+        all_pairs_dist = _load_or_compute_apspd(name, data, N, cache_dir)
     else:
         all_pairs_dist = None
 

@@ -20,6 +20,7 @@ from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 from goblin.config import DATA_CACHE
 from goblin.data import (
     apply_lin_gaussian_operator,
+    apply_lin_gaussian_operator_slow,
     apply_lin_heat_operator,
     get_L_sym_eigvals_eigvecs,
     get_fixed_operator,
@@ -951,13 +952,13 @@ class GOBLIN:
         # Get Yhat fit on train_fit
         splits = ("train_fit",)
         if (splits, mu) not in self._lin_gaussian_cache:
-            F = apply_lin_gaussian_operator(
-                # all_pairs_dist=self.all_pairs_dist,
-                X=self.X,
-                mu=mu,
-                sigma=self.sigma,
-                cache_dir=(self.cache_dir / f"apspd/lingauss/{self.dataset_name}"),
-            )
+            if self.all_pairs_dist is not None:
+                F = apply_lin_gaussian_operator_slow(self.all_pairs_dist, self.X, mu=mu, sigma=self.sigma)
+            else:
+                F = apply_lin_gaussian_operator(
+                    X=self.X, mu=mu, sigma=self.sigma,
+                    cache_dir=(self.cache_dir / f"apspd/lingauss/{self.dataset_name}"),
+                )
             Yhat = self.solve_linear_gnn(F=F, splits=list(splits))
             self._lin_gaussian_cache[(splits, mu)] = Yhat
         else:
@@ -1202,12 +1203,13 @@ class GOBLIN:
                 if key in self._lin_gaussian_cache:
                     Yhat.append(self._lin_gaussian_cache[key])
                     continue
-                F = apply_lin_gaussian_operator(
-                    X=self.X,
-                    mu=mu,
-                    sigma=self.sigma,
-                    cache_dir=(self.cache_dir / f"apspd/lingauss/{self.dataset_name}"),
-                )
+                if self.all_pairs_dist is not None:
+                    F = apply_lin_gaussian_operator_slow(self.all_pairs_dist, self.X, mu=mu, sigma=self.sigma)
+                else:
+                    F = apply_lin_gaussian_operator(
+                        X=self.X, mu=mu, sigma=self.sigma,
+                        cache_dir=(self.cache_dir / f"apspd/lingauss/{self.dataset_name}"),
+                    )
             elif op.family == "heat":
                 tausqrt = op.param
                 tau = tausqrt**2
@@ -1252,12 +1254,13 @@ class GOBLIN:
                     Yhat.append(Yhat_expert)
                     continue
                 # Compute
-                F = apply_lin_gaussian_operator(
-                    X=self.X,
-                    mu=mu,
-                    sigma=self.sigma,
-                    cache_dir=(self.cache_dir / f"apspd/lingauss/{self.dataset_name}"),
-                )
+                if self.all_pairs_dist is not None:
+                    F = apply_lin_gaussian_operator_slow(self.all_pairs_dist, self.X, mu=mu, sigma=self.sigma)
+                else:
+                    F = apply_lin_gaussian_operator(
+                        X=self.X, mu=mu, sigma=self.sigma,
+                        cache_dir=(self.cache_dir / f"apspd/lingauss/{self.dataset_name}"),
+                    )
             elif op.family == "heat":
                 tausqrt = op.param
                 tau = tausqrt**2
@@ -1302,12 +1305,13 @@ class GOBLIN:
         Fs = []
         for op in self.basis:
             if op.family == "gaussian":
-                F = apply_lin_gaussian_operator(
-                    X=self.X,
-                    mu=op.param,
-                    sigma=self.sigma,
-                    cache_dir=(self.cache_dir / f"apspd/lingauss/{self.dataset_name}"),
-                )
+                if self.all_pairs_dist is not None:
+                    F = apply_lin_gaussian_operator_slow(self.all_pairs_dist, self.X, mu=op.param, sigma=self.sigma)
+                else:
+                    F = apply_lin_gaussian_operator(
+                        X=self.X, mu=op.param, sigma=self.sigma,
+                        cache_dir=(self.cache_dir / f"apspd/lingauss/{self.dataset_name}"),
+                    )
             elif op.family == "heat":
                 F = apply_lin_heat_operator(
                     tau=op.param ** 2,
@@ -1338,10 +1342,13 @@ class GOBLIN:
         n_gauss = cfg.pool_size // 2
         mus = rng.uniform(cfg_s.mu_min, cfg_s.mu_max, n_gauss)
         for mu in tqdm(mus, desc="Pool: Gaussian ops", unit="op", leave=False):
-            F = apply_lin_gaussian_operator(
-                X=self.X, mu=float(mu), sigma=self.sigma,
-                cache_dir=self.cache_dir / f"apspd/lingauss/{self.dataset_name}",
-            )
+            if self.all_pairs_dist is not None:
+                F = apply_lin_gaussian_operator_slow(self.all_pairs_dist, self.X, mu=float(mu), sigma=self.sigma)
+            else:
+                F = apply_lin_gaussian_operator(
+                    X=self.X, mu=float(mu), sigma=self.sigma,
+                    cache_dir=self.cache_dir / f"apspd/lingauss/{self.dataset_name}",
+                )
             ops.append(OpId(family="gaussian", param=float(mu)))
             Fs.append(F)
 

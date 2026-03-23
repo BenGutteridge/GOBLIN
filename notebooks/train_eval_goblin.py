@@ -31,11 +31,11 @@ hparams = {
     "train_ds": "Cora",
     "seed": 0,
     "bo_objective": "trimmed_20",
-    "basis_size": 5,
+    "basis_size": 3,
     "basis_selection_rule": "greedy_diversity",  # "top_k" | "greedy_diversity"
     "enforce_family_coverage": False,
-    "n_samples": 15,    # total linear GNN solves including anchors
-    "ucb_beta": 1.0,    # β in acq = -µ_GP + β·σ_GP; 0 = pure exploitation
+    "n_samples": 25,    # total linear GNN solves including anchors
+    "ucb_beta": 3.0,    # β in acq = -µ_GP + β·σ_GP; 0 = pure exploitation
     # LinGauss
     "mu_min": 0.0,
     "mu_max": 8.0,
@@ -46,31 +46,32 @@ hparams = {
     "tausqrt_max": 5.0,
     "tausqrt_num": 50,
     "diversity_lambda": 0.2,  # λ for greedy_diversity rule (0 = pure top-k)
-    "mu_anchors": 1.0,         # gaussian family anchors: float, list[float], int (N auto-spaced), or None
-    "tausqrt_anchors": 1.5,   # heat family anchors: float, list[float], int (N auto-spaced), or None
+    "mu_anchors": 5,           # gaussian family anchors: int (N auto-spaced), float, list[float], or None
+    "tausqrt_anchors": 2,     # heat family anchors: int (N auto-spaced), float, list[float], or None
     "num_fixed_operators": 1,
-    "fixed_operators": ["L1"],
     # Adaptive search bounds (0 = use fixed bounds; >0 = scale by mean SPD)
-    "mu_max_spd_sf": 0.0,       # mu_max      = mu_max_spd_sf      * mean_SPD (or mu_max      if 0)
-    "tausqrt_max_spd_sf": 0.0,  # tausqrt_max = tausqrt_max_spd_sf * mean_SPD (or tausqrt_max if 0)
+    "spd_scale_factor_mu": 1.25,   # mu_max      = spd_scale_factor_mu  * mean_SPD (or mu_max      if 0)
+    "spd_scale_factor_tau": 1.25,  # tausqrt_max = spd_scale_factor_tau * mean_SPD (or tausqrt_max if 0)
     # GP
     "rbf_length_scale": 1.0,
     "white_noise": 0.2,
     # DeepSet
     "lr": 3e-4,
-    "dropout": 0.0,
-    "hidden_dim": 32,
-    "attn_temp": 10.0,
-    "num_deepset_layers": 2,
+    "dropout": 0.1,
+    "hidden_dim": 64,
+    "attn_temp": 2.0,
+    "num_deepset_layers": 3,
     "num_head_layers": 1,
-    "epochs": 500,
+    "epochs": 1000,
     "score_feature": "none",  # "none" | "trimmed" | "trimmed_and_lower_half"
-    "weight_selection": "current",   # "current" | "pre_filter" | "mask_by_deepset"
-    "feature_set_size": "all",       # "all" | "top_half" | "basis_size"
-    # stochastic training (set to False to use fixed full-batch training)
-    "stochastic_training": False,
-    "n_batches": 1000,
-    "batch_size": 40, # for Cora with very few labels
+    "weight_selection": "pre_filter",  # "current" | "pre_filter" | "mask_by_deepset"
+    "feature_set_size": "all",         # "all" | "top_half" | "basis_size"
+    # Training mode: "pool" (canonical), "stochastic", or "batch"
+    "training_mode": "pool",
+    "pool_size": 50,
+    "n_ops_per_batch": 5,
+    "n_batches": 500,
+    "batch_size": 40,
     "n_ref_per_class": 5,
 }
 
@@ -147,9 +148,9 @@ model_ckpt_path = Path(f"ckpts/goblin/{hparam_hash}.pt")
 # Use per-dataset results path when eval_dataset is specified, to avoid race
 # conditions when multiple parallel jobs share the same hparam_hash.
 if _args.eval_dataset is not None:
-    results_path = Path(f"output/results/goblin/{hparam_hash}/{_args.eval_dataset}.pt")
+    results_path = Path(f"results/goblin/{hparam_hash}/{_args.eval_dataset}.pt")
 else:
-    results_path = Path(f"output/results/goblin/{hparam_hash}.pt")
+    results_path = Path(f"results/goblin/{hparam_hash}.pt")
 results_path.parent.mkdir(parents=True, exist_ok=True)
 model_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -185,8 +186,8 @@ _train_mean_spd = compute_mean_spd(
     all_pairs_dist,
     cache_dir=lingauss_cache_dir / p["train_ds"] if all_pairs_dist is None else None,
 )
-_train_mu_max = p["mu_max_spd_sf"] * _train_mean_spd if p["mu_max_spd_sf"] > 0 else p["mu_max"]
-_train_tausqrt_max = p["tausqrt_max_spd_sf"] * _train_mean_spd if p["tausqrt_max_spd_sf"] > 0 else p["tausqrt_max"]
+_train_mu_max = p["spd_scale_factor_mu"] * _train_mean_spd if p["spd_scale_factor_mu"] > 0 else p["mu_max"]
+_train_tausqrt_max = p["spd_scale_factor_tau"] * _train_mean_spd if p["spd_scale_factor_tau"] > 0 else p["tausqrt_max"]
 print(f"Train mean SPD: {_train_mean_spd:.3f} → mu_max={_train_mu_max:.3f}, tausqrt_max={_train_tausqrt_max:.3f}")
 
 operator_cfg = OperatorSearchConfig(
@@ -207,7 +208,7 @@ multi_search_cfg = MultiSearchConfig(
     n_samples=p["n_samples"],
     basis_size=p["basis_size"],
     enforce_family_coverage=p["enforce_family_coverage"],
-    include_fixed_ops=p["fixed_operators"],
+    include_fixed_ops=["L2"] if p.get("num_fixed_operators", 0) > 0 else [],
     basis_selection_rule=p["basis_selection_rule"],
     diversity_lambda=p["diversity_lambda"],
     mu_anchors=p["mu_anchors"],
@@ -228,6 +229,8 @@ deepset_cfg = ExpertsDeepSetConfig(
     n_batches=p["n_batches"],
     batch_size=p["batch_size"],
     n_ref_per_class=p["n_ref_per_class"],
+    pool_size=p["pool_size"],
+    n_ops_per_batch=p["n_ops_per_batch"],
 )
 
 goblin = GOBLIN(
@@ -254,7 +257,9 @@ basis = goblin.select_basis()
 print("Final basis:", basis)
 
 # ---- Train DeepSet ----
-if p["stochastic_training"]:
+if p["training_mode"] == "pool":
+    metrics = goblin.train_deepset_pool(verbose=True)
+elif p["training_mode"] == "stochastic":
     metrics = goblin.train_deepset_stochastic(verbose=True)
 else:
     metrics = goblin.train_deepset(verbose=True)
@@ -290,8 +295,8 @@ for k in tqdm(range(1, int(p["mu_max"]) + 1)):
         max_dist=recommended_max_dist(_mean_spd),  # previously set to 10
         cache_dir=hopsign_cache_dir / ds_name,
     )
-    _mu_max = p["mu_max_spd_sf"] * _mean_spd if p["mu_max_spd_sf"] > 0 else p["mu_max"]
-    _tausqrt_max = p["tausqrt_max_spd_sf"] * _mean_spd if p["tausqrt_max_spd_sf"] > 0 else p["tausqrt_max"]
+    _mu_max = p["spd_scale_factor_mu"] * _mean_spd if p["spd_scale_factor_mu"] > 0 else p["mu_max"]
+    _tausqrt_max = p["spd_scale_factor_tau"] * _mean_spd if p["spd_scale_factor_tau"] > 0 else p["tausqrt_max"]
 
     eval_goblin = GOBLIN(
         data=test_dataset["data"],
@@ -350,8 +355,8 @@ for ds in tqdm(eval_ds):
         all_pairs_dist,
         cache_dir=lingauss_cache_dir / ds if all_pairs_dist is None else None,
     )
-    _mu_max = p["mu_max_spd_sf"] * _mean_spd if p["mu_max_spd_sf"] > 0 else p["mu_max"]
-    _tausqrt_max = p["tausqrt_max_spd_sf"] * _mean_spd if p["tausqrt_max_spd_sf"] > 0 else p["tausqrt_max"]
+    _mu_max = p["spd_scale_factor_mu"] * _mean_spd if p["spd_scale_factor_mu"] > 0 else p["mu_max"]
+    _tausqrt_max = p["spd_scale_factor_tau"] * _mean_spd if p["spd_scale_factor_tau"] > 0 else p["tausqrt_max"]
 
     eval_goblin = GOBLIN(
         data=data,

@@ -326,8 +326,16 @@ class GraphDataset(pl.LightningDataModule):
 
         # APSPD is only needed for N*, D* channels and compute_range.
         # Skip it entirely for standard X/L/H channels to avoid expensive BFS.
+        # Also skip if all APSPD-dependent channels are already cached.
+        uncached_channels = [
+            chn for chn in sorted_channels
+            if not (
+                self.cache_dir
+                / f"{self.name}_{chn}_selfloop={cfg.add_self_loop}_bidirected={cfg.to_bidirected}_split={self.split_index}.pt"
+            ).exists()
+        ]
         _needs_apspd = cfg.get("compute_range", False) or any(
-            c[0] in ("N", "D") for c in sorted_channels
+            c[0] in ("N", "D") for c in uncached_channels
         )
         if _needs_apspd:
             self.get_all_pairs_shortest_path_distances()
@@ -1165,6 +1173,44 @@ class GraphDataset(pl.LightningDataModule):
         if os.path.exists(full_apspd_filepath):
             logger.info(f"Loading cached full APSPD from {full_apspd_filepath}")
             self.all_pairs_shortest_path_distances = torch.load(full_apspd_filepath)
+            return
+
+        # Try reconstructing from GOBLIN's per-shell sparse cache (avoids expensive BFS)
+        goblin_cache_dir = self.cache_dir / "apspd" / "lingauss" / self.name
+        if goblin_cache_dir.exists():
+            logger.info(
+                f"Constructing APSPD from GOBLIN per-shell cache at {goblin_cache_dir}"
+            )
+            spd_dense = torch.full((N, N), -1, dtype=torch.int8)
+            spd_dense[range(N), range(N)] = 0  # self-distance = 0
+            max_k = 0
+            for k in range(1, 100):
+                fpath = goblin_cache_dir / f"M_dist_{k}.pt"
+                if not fpath.exists():
+                    break
+                M_k = torch.load(fpath, map_location="cpu").coalesce()
+                r, c = M_k.indices()
+                spd_dense[r, c] = k
+                max_k = k
+                del M_k
+
+            mean_spd_file = goblin_cache_dir / "mean_spd.txt"
+            if mean_spd_file.exists():
+                avg_spd = float(mean_spd_file.read_text().strip())
+            else:
+                valid = spd_dense[spd_dense >= 0].float()
+                avg_spd = valid.mean().item()
+
+            self.all_pairs_shortest_path_distances = {
+                "spd": spd_dense,
+                "average_deg": self.g.num_edges() / N,
+                "diameter": max_k,
+                "avg_spd": avg_spd,
+            }
+            torch.save(
+                self.all_pairs_shortest_path_distances, full_apspd_filepath
+            )
+            logger.info(f"Saved reconstructed APSPD to {full_apspd_filepath}")
             return
 
         if cfg.max_khops is not None:

@@ -314,7 +314,7 @@ def main():
     model_tag = f"{args.model}_L{args.num_layers}"
     if args.model == "gat":
         model_tag += f"_H{args.num_heads}"
-    out_dir = ROOT / "output" / "results" / "gnn" / model_tag
+    out_dir = ROOT / "results" / "gnn" / args.model
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{args.dataset}.json"
     result = {

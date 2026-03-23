@@ -10,4 +10,4 @@ before importing goblin, or set goblin.config.DATA_CACHE directly:
 import os
 from pathlib import Path
 
-DATA_CACHE: Path = Path(os.environ.get("GOBLIN_DATA_CACHE", "/data-gauss/bengut/GraphAny-Range/data_cache"))
+DATA_CACHE: Path = Path(os.environ.get("GOBLIN_DATA_CACHE", "data_cache"))
